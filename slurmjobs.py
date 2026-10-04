@@ -248,7 +248,6 @@ def job_lines(job, indent='', compact=False):
         yield detail('Time', timing)
     if job.state == 'PENDING' and job.reason not in ('', 'None', '(null)'):
         yield detail('Waiting', job.reason)
-    yield Text('')
 
 
 def wrap_lines(lines, width):
@@ -283,13 +282,13 @@ def render(jobs, user, compact=False, width=80):
             others[job.user].append(job)
     def sort(jobs):
         return sorted(jobs, key=lambda j: (0 if j.state == 'RUNNING' else 1 if j.state == 'PENDING' else 2, j.id))
-    lines = [Text(f'MY JOBS · {user} · {len(own)} jobs', style='bold #ffffff on #000000'), Text('')]
+    lines = [Text(f'MY JOBS · {user} · {len(own)} jobs', style='bold #ffffff on #000000')]
     for job in sort(own):
         lines.extend(job_lines(job, compact=compact))
     if not own:
-        lines.extend([Text('  No active jobs.', style='dim'), Text('')])
+        lines.append(Text('  No active jobs.', style='dim'))
     if others:
-        lines.extend([Text(f'OTHER USERS · {sum(map(len, others.values()))} jobs', style='bold #ffffff on #000000'), Text('')])
+        lines.extend([Text(''), Text(f'OTHER USERS · {sum(map(len, others.values()))} jobs', style='bold #ffffff on #000000')])
         for name, group in sorted(others.items()):
             lines.append(Text(name, style='bold #ffffff on #000000'))
             for job in sort(group):

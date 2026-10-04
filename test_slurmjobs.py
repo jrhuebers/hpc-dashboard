@@ -254,6 +254,19 @@ class RenderingTests(unittest.TestCase):
         self.assertLess(output.index('amy'), output.index('zoe'))
         self.assertIn('  5 · example', output)
 
+    def test_only_section_boundary_has_blank_line(self):
+        own = s.from_json(raw_job(), 1000)
+        others = [s.from_json(raw_job(job_id=i, user_name=user), 1000)
+                  for i, user in [(2, 'alice'), (3, 'bob')]]
+        for jobs in ([own], [], [own, *others], others):
+            lines = self.text(jobs).splitlines()
+            blanks = [i for i, line in enumerate(lines) if not line.strip()]
+            if any(job.user != 'me' for job in jobs):
+                boundary = next(i for i, line in enumerate(lines) if line.startswith('OTHER USERS'))
+                self.assertEqual(blanks, [boundary - 1])
+            else:
+                self.assertEqual(blanks, [])
+
     def test_header_colors(self):
         from rich.style import Style
         jobs = [s.from_json(raw_job(), 1000),
