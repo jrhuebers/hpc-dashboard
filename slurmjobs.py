@@ -202,6 +202,7 @@ class Queue:
     def __init__(self, timeout=10):
         self.timeout = timeout
         self.legacy = False
+        self.steps_json = True
 
     def run(self, args):
         try:
@@ -233,24 +234,45 @@ class Queue:
         return [from_text(line) for line in result.stdout.splitlines() if line.strip()]
 
     def fetch_steps(self, me=None):
-        """One batched query; return None on failure rather than inventing zero."""
+        """Count RUNNING steps in one query; unavailable states are not zero."""
+        if self.legacy or not self.steps_json:
+            return None
         filters = ['--user', me] if me else []
         try:
-            result = self.run(['--steps', '--noheader', '--format=%i', *filters])
+            result = self.run(['--steps', '--json', *filters])
         except RuntimeError:
             return None
         if result.returncode:
+            error = result.stderr.lower()
+            if 'json' in error and any(s in error for s in ('unrecognized', 'unknown', 'invalid option', 'not supported')):
+                self.steps_json = False
             return None
-        steps = defaultdict(set)
-        for line in result.stdout.splitlines():
-            step = line.strip()
-            if not step:
-                continue
-            if not re.fullmatch(r'\d+(?:_\d+)?(?:\+\d+)?\.[\w-]+', step):
+        try:
+            data = json.loads(result.stdout)
+            if not isinstance(data, dict) or data.get('errors') or not isinstance(data.get('steps'), list):
                 return None
-            job_id = step.rsplit('.', 1)[0]
-            steps[job_id].add(step)
-        return {job_id: len(ids) for job_id, ids in steps.items()}
+            steps = defaultdict(set)
+            for raw in data['steps']:
+                step = raw.get('id', '')
+                states = raw.get('state')
+                states = [states] if isinstance(states, str) else states
+                if (not isinstance(step, str) or
+                        not re.fullmatch(r'\d+(?:_\d+)?(?:\+\d+)?\.[\w-]+', step) or
+                        not isinstance(states, list) or not states or
+                        not all(isinstance(state, str) for state in states)):
+                    return None
+                if 'RUNNING' not in states:
+                    continue
+                job_id = step.rsplit('.', 1)[0]
+                array = raw.get('array') or {}
+                array_id = number(array.get('job_id'))
+                task_id = number(array.get('task_id'), None)
+                if array_id and task_id is not None and task_id != 4294967294:
+                    job_id = f'{array_id}_{task_id}'
+                steps[job_id].add(step)
+            return {job_id: len(ids) for job_id, ids in steps.items()}
+        except (ValueError, TypeError, AttributeError):
+            return None
 
 
 def job_lines(job, indent='', compact=False, usage=None):
@@ -260,9 +282,9 @@ def job_lines(job, indent='', compact=False, usage=None):
     title.append(job.state, style=state_color)
     if job.steps_queried:
         if job.step_count is None:
-            title.append(' · steps ?', style=GREY)
+            title.append(' · running steps ?', style=GREY)
         else:
-            title.append(f' · {job.step_count} step' + ('' if job.step_count == 1 else 's'), style=GREY)
+            title.append(f' · {job.step_count} running step' + ('' if job.step_count == 1 else 's'), style=GREY)
     yield title
     def detail(label, value):
         text = Text(indent + '  ' + f'{label:<11}', style=GREY, overflow='fold')

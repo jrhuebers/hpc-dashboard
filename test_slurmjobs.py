@@ -218,30 +218,56 @@ class QueueTests(unittest.TestCase):
 class StepTests(unittest.TestCase):
     @patch('slurmjobs.subprocess.run')
     def test_batched_step_counts_include_reserved_and_named_steps(self, run):
-        run.return_value = subprocess.CompletedProcess([], 0,
-            '42.batch\n42.extern\n42.1\n42.1\n43_7.0\n44+1.batch\n', '')
+        payload = {'steps': [dict(id=step, state=['RUNNING'])
+                            for step in ('42.batch', '42.extern', '42.1', '42.1', '44+1.batch')]}
+        payload['steps'].append(dict(id='69.0', state='RUNNING', array=dict(job_id=43, task_id=7)))
+        run.return_value = subprocess.CompletedProcess([], 0, json.dumps(payload), '')
         self.assertEqual(s.Queue().fetch_steps('me'), {'42': 3, '43_7': 1, '44+1': 1})
-        self.assertEqual(run.call_args.args[0],
-                         ['squeue', '--steps', '--noheader', '--format=%i', '--user', 'me'])
+        self.assertEqual(run.call_args.args[0], ['squeue', '--steps', '--json', '--user', 'me'])
 
     @patch('slurmjobs.subprocess.run')
     def test_failed_or_malformed_step_query_is_unknown(self, run):
-        for result in (subprocess.CompletedProcess([], 1, '', 'unavailable'),
-                       subprocess.CompletedProcess([], 0, 'malformed\n', '')):
-            run.return_value = result
+        payloads = ('malformed', '{}', '{"steps": [{}]}', '{"steps": [], "errors": ["failure"]}',
+                    '{"steps": [{"id": "42.0", "state": []}]}')
+        for payload in payloads:
+            run.return_value = subprocess.CompletedProcess([], 0, payload, '')
             self.assertIsNone(s.Queue().fetch_steps())
+        run.return_value = subprocess.CompletedProcess([], 1, '', 'unavailable')
+        self.assertIsNone(s.Queue().fetch_steps())
         run.side_effect = subprocess.TimeoutExpired('squeue', 1)
         self.assertIsNone(s.Queue(timeout=1).fetch_steps())
 
     @patch('slurmjobs.subprocess.run')
     def test_empty_steps_are_a_successful_zero(self, run):
-        run.return_value = subprocess.CompletedProcess([], 0, '', '')
+        run.return_value = subprocess.CompletedProcess([], 0, '{"steps": []}', '')
         self.assertEqual({}, s.Queue().fetch_steps())
+
+    @patch('slurmjobs.subprocess.run')
+    def test_only_running_steps_count(self, run):
+        steps = [dict(id=f'42.{i}', state=[state]) for i, state in enumerate(
+            ('RUNNING', 'COMPLETING', 'COMPLETED', 'CANCELLED', 'SUSPENDED', 'PENDING'))]
+        run.return_value = subprocess.CompletedProcess([], 0, json.dumps({'steps': steps}), '')
+        self.assertEqual({'42': 1}, s.Queue().fetch_steps())
+        run.return_value = subprocess.CompletedProcess([], 0, json.dumps({'steps': steps[1:]}), '')
+        self.assertEqual({}, s.Queue().fetch_steps())
+
+    @patch('slurmjobs.subprocess.run')
+    def test_unsupported_step_json_not_retried_or_guessed(self, run):
+        run.return_value = subprocess.CompletedProcess([], 1, '', 'unrecognized option --json')
+        queue = s.Queue()
+        self.assertIsNone(queue.fetch_steps())
+        self.assertIsNone(queue.fetch_steps())
+        run.assert_called_once()
+        queue = s.Queue()
+        queue.legacy = True
+        self.assertIsNone(queue.fetch_steps())
+        run.assert_called_once()
 
     def test_title_step_count_plural_and_unknown(self):
         job = s.from_json(raw_job(), 1000)
         job.steps_queried = True
-        for count, suffix in ((0, '0 steps'), (1, '1 step'), (3, '3 steps'), (None, 'steps ?')):
+        for count, suffix in ((0, '0 running steps'), (1, '1 running step'),
+                              (3, '3 running steps'), (None, 'running steps ?')):
             job.step_count = count
             self.assertTrue(list(s.job_lines(job))[0].plain.endswith('RUNNING · ' + suffix))
 
