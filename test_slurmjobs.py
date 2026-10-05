@@ -4,7 +4,7 @@ import json
 import math
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from rich.console import Console
 import slurmjobs as s
@@ -215,6 +215,48 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(s.Queue().fetch(), [])
 
 
+class CacheTests(unittest.TestCase):
+    @patch('slurmjobs.time.monotonic')
+    def test_refresh_throttles_queue_and_updates_elapsed(self, clock):
+        clock.return_value = 100
+        job = s.from_json(raw_job(), 1000)
+        queue = Mock()
+        queue.fetch.return_value = [job]
+        cache = s.QueueCache(queue, 'me')
+        self.assertEqual(cache.fetch()[0].elapsed, 100)
+        clock.return_value = 101
+        self.assertEqual(cache.fetch()[0].elapsed, 101)
+        self.assertEqual(job.elapsed, 100)
+        queue.fetch.assert_called_once_with('me')
+        clock.return_value = 110
+        cache.fetch()
+        self.assertEqual(queue.fetch.call_count, 2)
+
+    @patch('slurmjobs.time.monotonic')
+    def test_failure_preserves_good_snapshot_and_backs_off(self, clock):
+        clock.return_value = 100
+        queue = Mock()
+        queue.fetch.return_value = [s.from_json(raw_job(), 1000)]
+        cache = s.QueueCache(queue)
+        cache.fetch()
+        clock.return_value = 110
+        queue.fetch.side_effect = RuntimeError('offline')
+        with self.assertRaises(RuntimeError):
+            cache.fetch()
+        clock.return_value = 111
+        self.assertEqual(cache.fetch()[0].elapsed, 111)
+        self.assertEqual(queue.fetch.call_count, 2)
+
+    @patch('slurmjobs.time.monotonic', return_value=100)
+    def test_pending_elapsed_not_extrapolated(self, clock):
+        queue = Mock()
+        queue.fetch.return_value = [s.from_json(raw_job(job_state=['PENDING']), 1000)]
+        cache = s.QueueCache(queue)
+        cache.fetch()
+        clock.return_value = 105
+        self.assertEqual(cache.fetch()[0].elapsed, 0)
+
+
 class RenderingTests(unittest.TestCase):
     def text(self, jobs, width=80, compact=False):
         buffer = io.StringIO()
@@ -278,6 +320,27 @@ class RenderingTests(unittest.TestCase):
             style = Style.parse(header.style)
             self.assertEqual(style.color.get_truecolor(), (255, 255, 255))
             self.assertEqual(style.bgcolor.get_truecolor(), (0, 0, 0))
+
+    def test_usage_literal_wrapping_and_own_jobs_only(self):
+        own = s.from_json(raw_job(), 1000)
+        other = s.from_json(raw_job(job_id=43, user_name='other'), 1000)
+        usage = {'42': 'CPU 1/8 cores · RAM 1 GiB · GPU [red]not markup[/red]',
+                 '43': 'must not appear'}
+        group = s.render([own, other], 'me', width=40, usage=usage)
+        lines = list(group.renderables)
+        self.assertTrue(all(len(line.plain) <= 40 for line in lines))
+        joined = ''.join(line.plain.strip() for line in lines)
+        self.assertIn('[red]not markup[/red]', joined)
+        self.assertNotIn('must not appear', joined)
+        self.assertTrue(any(line.plain.startswith(' ' * 13) for line in lines))
+
+    def test_watch_default_one_second(self):
+        with patch('slurmjobs.sys.argv', ['sj', '--help']):
+            with patch('sys.stdout', new=io.StringIO()) as output:
+                with self.assertRaises(SystemExit) as exc:
+                    s.main()
+            self.assertEqual(exc.exception.code, 0)
+            self.assertIn('default: 1;', output.getvalue())
 
     def test_pending_reason_compact_and_empty(self):
         job = s.from_json(raw_job(job_state=['PENDING'], state_reason='Priority', nodes='', comment=''), 1000)

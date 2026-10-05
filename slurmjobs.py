@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only, vertically formatted Slurm queue viewer."""
+"""Vertically formatted Slurm queue viewer with optional job telemetry."""
 import argparse
 import getpass
 import json
@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -226,7 +226,7 @@ class Queue:
         return [from_text(line) for line in result.stdout.splitlines() if line.strip()]
 
 
-def job_lines(job, indent='', compact=False):
+def job_lines(job, indent='', compact=False, usage=None):
     state_color = 'green' if job.state == 'RUNNING' else 'yellow' if job.state == 'PENDING' else 'cyan'
     # Continuation indentation is preserved even for very long names/comments.
     title = Text(indent + job.id + ' · ' + job.name + '  ', style='bold', overflow='fold')
@@ -246,6 +246,8 @@ def job_lines(job, indent='', compact=False):
     else:
         yield detail('Resources', resources)
         yield detail('Time', timing)
+    if usage is not None:
+        yield detail('Usage', clean(usage))
     if job.state == 'PENDING' and job.reason not in ('', 'None', '(null)'):
         yield detail('Waiting', job.reason)
 
@@ -257,7 +259,7 @@ def wrap_lines(lines, width):
     for line in lines:
         plain = line.plain
         indent = len(plain) - len(plain.lstrip(' '))
-        detail = plain.lstrip().startswith(('Comment ', 'Location ', 'Resources ', 'Time ', 'Waiting '))
+        detail = plain.lstrip().startswith(('Comment ', 'Location ', 'Resources ', 'Time ', 'Waiting ', 'Usage '))
         prefix = indent + 13 if detail else indent + 2
         if not plain or len(plain) <= width and '\n' not in plain:
             result.append(line)
@@ -274,7 +276,7 @@ def wrap_lines(lines, width):
     return result
 
 
-def render(jobs, user, compact=False, width=80):
+def render(jobs, user, compact=False, width=80, usage=None):
     own = [job for job in jobs if job.user == user]
     others = defaultdict(list)
     for job in jobs:
@@ -284,7 +286,7 @@ def render(jobs, user, compact=False, width=80):
         return sorted(jobs, key=lambda j: (0 if j.state == 'RUNNING' else 1 if j.state == 'PENDING' else 2, j.id))
     lines = [Text(f'MY JOBS · {user} · {len(own)} jobs', style='bold #ffffff on #000000')]
     for job in sort(own):
-        lines.extend(job_lines(job, compact=compact))
+        lines.extend(job_lines(job, compact=compact, usage=(usage or {}).get(job.id)))
     if not own:
         lines.append(Text('  No active jobs.', style='dim'))
     if others:
@@ -296,6 +298,28 @@ def render(jobs, user, compact=False, width=80):
     return Group(*wrap_lines(lines, width))
 
 
+class QueueCache:
+    """Render at 1 Hz without polling the scheduler at 1 Hz."""
+    def __init__(self, queue, user=None, interval=10):
+        self.queue = queue
+        self.user = user
+        self.interval = interval
+        self.jobs = None
+        self.fetched = 0
+        self.attempted = -math.inf
+
+    def fetch(self):
+        now = time.monotonic()
+        if self.jobs is None or now - self.attempted >= self.interval:
+            # Retain the last good queue on failure, and retry at the usual cadence.
+            self.attempted = now
+            self.jobs = self.queue.fetch(self.user)
+            now = self.fetched = time.monotonic()
+        age = max(0, now - self.fetched)
+        return [replace(job, elapsed=job.elapsed + age)
+                if job.state == 'RUNNING' else job for job in self.jobs]
+
+
 def positive(value):
     result = float(value)
     if not math.isfinite(result) or result <= 0:
@@ -304,26 +328,41 @@ def positive(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Readable, read-only Slurm jobs. Time is elapsed/limit.')
+    parser = argparse.ArgumentParser(description='Readable Slurm jobs. --usage starts persistent collectors in your jobs. Time is elapsed/limit.')
     parser.add_argument('--me', action='store_true', help='show only your jobs')
     parser.add_argument('--watch', action='store_true', help='refresh in place; Ctrl-C to stop')
-    parser.add_argument('--interval', type=positive, default=10, help='watch interval in seconds (default: 10)')
+    parser.add_argument('--interval', type=positive, default=1, help='display refresh in seconds (default: 1; queue queried every 10s)')
+    parser.add_argument('--usage', action='store_true', help='start/reuse persistent CPU/RAM/GPU collectors for your running jobs')
     parser.add_argument('--timeout', type=positive, default=10, help='scheduler query timeout (default: 10)')
     parser.add_argument('--compact', action='store_true', help='combine resources and time')
     parser.add_argument('--no-color', action='store_true', help='disable colors')
     args = parser.parse_args()
     console = Console(no_color=args.no_color or 'NO_COLOR' in os.environ, highlight=False)
     user = getpass.getuser()
-    queue = Queue(args.timeout)
+    if args.watch and not console.is_terminal:
+        parser.error('--watch requires a terminal; omit it for piped output')
+    queue = QueueCache(Queue(args.timeout), user if args.me else None)
+    telemetry = None
+    if args.usage:
+        # Resolve sibling module even when invoked through ~/.local/bin/sj.
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        from telemetry import Telemetry
+        telemetry = Telemetry(user, timeout=args.timeout)
     def frame():
-        return render(queue.fetch(user if args.me else None), user, args.compact, console.width)
+        jobs = queue.fetch()
+        usage = None
+        if telemetry is not None:
+            try:
+                usage = telemetry.fetch(jobs)
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+                usage = {job.id: 'Telemetry unavailable: ' + clean(exc)
+                         for job in jobs if job.user == user and job.state == 'RUNNING'}
+        return render(jobs, user, args.compact, console.width, usage=usage)
     try:
         initial = frame()
         if not args.watch:
             console.print(initial)
             return 0
-        if not console.is_terminal:
-            parser.error('--watch requires a terminal; omit it for piped output')
         # No alternate screen: output remains accessible in terminal scrollback.
         with Live(initial, console=console, auto_refresh=False, vertical_overflow='visible') as live:
             while True:
