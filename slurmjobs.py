@@ -6,7 +6,10 @@ import json
 import math
 import os
 import re
+import select
 import subprocess
+import termios
+import tty
 import sys
 import time
 from collections import defaultdict
@@ -15,6 +18,8 @@ from dataclasses import dataclass, replace
 from rich.console import Console, Group
 from rich.live import Live
 from rich.text import Text
+
+GREY = '#707070'
 
 
 def number(value, default=0):
@@ -233,7 +238,7 @@ def job_lines(job, indent='', compact=False, usage=None):
     title.append(job.state, style=state_color)
     yield title
     def detail(label, value):
-        text = Text(indent + '  ' + f'{label:<11}', style='dim', overflow='fold')
+        text = Text(indent + '  ' + f'{label:<11}', style=GREY, overflow='fold')
         text.append(value, style='default')
         return text
     if job.comment.strip():
@@ -288,7 +293,7 @@ def render(jobs, user, compact=False, width=80, usage=None):
     for job in sort(own):
         lines.extend(job_lines(job, compact=compact, usage=(usage or {}).get(job.id)))
     if not own:
-        lines.append(Text('  No active jobs.', style='dim'))
+        lines.append(Text('  No active jobs.', style=GREY))
     if others:
         lines.extend([Text(''), Text(f'OTHER USERS · {sum(map(len, others.values()))} jobs', style='bold #ffffff on #000000')])
         for name, group in sorted(others.items()):
@@ -320,6 +325,51 @@ class QueueCache:
                 if job.state == 'RUNNING' else job for job in self.jobs]
 
 
+class WatchKeys:
+    """Temporary cbreak input; preserve Ctrl-C and always restore the terminal."""
+    def __enter__(self):
+        self.fd = None
+        self.saved = None
+        try:
+            fd = sys.stdin.fileno()
+            if os.isatty(fd):
+                self.saved = termios.tcgetattr(fd)
+                self.fd = fd
+                tty.setcbreak(fd)
+        except (OSError, ValueError, AttributeError, termios.error):
+            self.__exit__(None, None, None)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None and self.saved is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            except (OSError, termios.error):
+                pass
+        self.fd = None
+
+    def wait(self, interval):
+        if self.fd is None:
+            time.sleep(interval)
+            return False
+        deadline = time.monotonic() + interval
+        while True:
+            remaining = max(0, deadline - time.monotonic())
+            if not select.select([self.fd], [], [], remaining)[0]:
+                return False
+            data = os.read(self.fd, 1024)
+            if not data:
+                return True  # Input terminal closed.
+            if b'\x1b' in data and select.select([self.fd], [], [], 0.03)[0]:
+                data += os.read(self.fd, 1024)
+            # Ignore complete arrow/function-key sequences; standalone Esc quits.
+            data = re.sub(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|O.)', b'', data)
+            if b'q' in data or b'\x1b' in data:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+
+
 def positive(value):
     result = float(value)
     if not math.isfinite(result) or result <= 0:
@@ -330,7 +380,7 @@ def positive(value):
 def main():
     parser = argparse.ArgumentParser(description='Readable Slurm jobs. --usage starts persistent collectors in your jobs. Time is elapsed/limit.')
     parser.add_argument('--me', action='store_true', help='show only your jobs')
-    parser.add_argument('--watch', action='store_true', help='refresh in place; Ctrl-C to stop')
+    parser.add_argument('--watch', action='store_true', help='refresh in place; q, Escape, or Ctrl-C to stop')
     parser.add_argument('--interval', type=positive, default=1, help='display refresh in seconds (default: 1; queue queried every 10s)')
     parser.add_argument('--usage', action='store_true', help='start/reuse persistent CPU/RAM/GPU collectors for your running jobs')
     parser.add_argument('--timeout', type=positive, default=10, help='scheduler query timeout (default: 10)')
@@ -364,9 +414,10 @@ def main():
             console.print(initial)
             return 0
         # No alternate screen: output remains accessible in terminal scrollback.
-        with Live(initial, console=console, auto_refresh=False, vertical_overflow='visible') as live:
+        with WatchKeys() as keys, Live(initial, console=console, auto_refresh=False, vertical_overflow='visible') as live:
             while True:
-                time.sleep(args.interval)
+                if keys.wait(args.interval):
+                    return 0
                 try:
                     live.update(frame(), refresh=True)
                 except (RuntimeError, ValueError, TypeError, KeyError) as exc:

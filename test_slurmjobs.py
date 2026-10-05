@@ -257,6 +257,47 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(cache.fetch()[0].elapsed, 0)
 
 
+class WatchKeyTests(unittest.TestCase):
+    @patch('slurmjobs.time.monotonic', return_value=100)
+    @patch('slurmjobs.os.read')
+    @patch('slurmjobs.select.select')
+    def test_quit_keys(self, ready, read, clock):
+        keys = s.WatchKeys()
+        keys.fd = 3
+        for value in (b'q', b'\x1b', b''):
+            read.return_value = value
+            ready.side_effect = [([3], [], []), ([], [], [])]
+            self.assertTrue(keys.wait(1), value)
+
+    @patch('slurmjobs.time.monotonic', return_value=100)
+    @patch('slurmjobs.os.read', return_value=b'\x1b[A')
+    @patch('slurmjobs.select.select', side_effect=[([3], [], []), ([], [], []), ([], [], [])])
+    def test_arrow_does_not_quit(self, ready, read, clock):
+        keys = s.WatchKeys()
+        keys.fd = 3
+        self.assertFalse(keys.wait(1))
+
+    @patch('slurmjobs.time.sleep')
+    def test_redirected_input_falls_back_to_sleep(self, sleep):
+        keys = s.WatchKeys()
+        keys.fd = None
+        self.assertFalse(keys.wait(1))
+        sleep.assert_called_once_with(1)
+
+    @patch('slurmjobs.tty.setcbreak')
+    @patch('slurmjobs.termios.tcsetattr')
+    @patch('slurmjobs.termios.tcgetattr', return_value=['saved'])
+    @patch('slurmjobs.os.isatty', return_value=True)
+    @patch('slurmjobs.sys.stdin')
+    def test_terminal_restored_on_exception(self, stdin, isatty, get, restore, cbreak):
+        stdin.fileno.return_value = 3
+        with self.assertRaises(RuntimeError):
+            with s.WatchKeys():
+                cbreak.assert_called_once_with(3)
+                raise RuntimeError('test')
+        restore.assert_called_once_with(3, s.termios.TCSADRAIN, ['saved'])
+
+
 class RenderingTests(unittest.TestCase):
     def text(self, jobs, width=80, compact=False):
         buffer = io.StringIO()
@@ -308,6 +349,12 @@ class RenderingTests(unittest.TestCase):
                 self.assertEqual(blanks, [boundary - 1])
             else:
                 self.assertEqual(blanks, [])
+
+    def test_detail_labels_use_darker_grey(self):
+        from rich.style import Style
+        lines = list(s.job_lines(s.from_json(raw_job(), 1000)))
+        for line in lines[1:]:
+            self.assertEqual(Style.parse(line.style).color.get_truecolor(), (112, 112, 112))
 
     def test_header_colors(self):
         from rich.style import Style
