@@ -85,6 +85,10 @@ def read_sample(path):
                 any(not finite_number(gpu.get(key)) or gpu[key] < 0
                     for key in ('util', 'used', 'total')) for gpu in gpus)):
         sample['gpus'] = []
+    for gpu in sample.get('gpus', []):
+        value = gpu.get('mem_util')
+        if not finite_number(value) or not 0 <= value <= 100:
+            gpu['mem_util'] = None
     return sample
 
 
@@ -319,8 +323,13 @@ class Telemetry:
                 if not sample or sample['time'] > now + CLOCK_SKEW:
                     continue
                 metrics = cached.setdefault(node, {})
-                for metric in ('cpu_cores', 'ram_mib', 'gpus'):
+                for metric in ('cpu_cores', 'ram_mib', 'gpus', 'gpu_mem_util'):
                     value = sample.get(metric)
+                    if metric == 'gpu_mem_util':
+                        devices = sample.get('gpus', [])
+                        value = ([g['mem_util'] for g in devices]
+                                 if devices and all(g.get('mem_util') is not None for g in devices)
+                                 else None)
                     if value is None or (metric == 'gpus' and not value):
                         continue
                     previous = metrics.get(metric)
@@ -379,8 +388,17 @@ class Telemetry:
             if job.gpu == 'no GPU':
                 gpu_label = 'no GPU'
             elif gpu:
+                mem_readings = [(node, cached[node]['gpu_mem_util']) for node in nodes
+                                if 'gpu_mem_util' in cached.get(node, {})]
+                mem_values = [v for _, reading in mem_readings for v in reading[0]]
+                mem_label = 'Mem activity unavailable'
+                if mem_values:
+                    mem_label = f'Mem activity {sum(mem_values) / len(mem_values):.0f}%'
+                    if len(mem_values) != len(gpu) or len(mem_readings) != len(readings):
+                        mem_label += ' (partial)'
+                    mem_label = retained(mem_label, mem_readings, 'gpu_mem_util')
                 gpu_label = (f'GPU device {sum(g["util"] for g in gpu) / len(gpu):.0f}% · '
-                             f'VRAM {sum(g["used"] for g in gpu) / 1024:.1f}/'
+                             f'{mem_label} · VRAM {sum(g["used"] for g in gpu) / 1024:.1f}/'
                              f'{sum(g["total"] for g in gpu) / 1024:.1f} GiB '
                              f'({len(readings)}/{len(nodes)} nodes)')
                 gpu_label = retained(gpu_label, readings, 'gpus')
@@ -484,7 +502,7 @@ def gpu_ids(value):
 
 def nvidia_query(kind='gpu'):
     """Return classified diagnostics, not arbitrary stderr/environment dumps."""
-    query = ('--query-gpu=index,uuid,utilization.gpu,memory.used,memory.total'
+    query = ('--query-gpu=index,uuid,utilization.gpu,utilization.memory,memory.used,memory.total'
              if kind == 'gpu' else '--query-compute-apps=pid,gpu_uuid')
     command = ['nvidia-smi', query, '--format=csv,noheader,nounits']
     try:
@@ -556,13 +574,20 @@ def gpu_sample(diagnostics=None):
     matched = 0
     for line in (output or '').splitlines():
         values = [v.strip() for v in line.split(',')]
-        if len(values) != 5 or values[1] not in authorized:
+        if len(values) != 6 or values[1] not in authorized:
             continue
         matched += 1
         try:
-            util, used, total = map(float, values[2:])
+            util, used, total = map(float, (values[2], values[4], values[5]))
+            try:
+                mem_util = float(values[3])
+                if not math.isfinite(mem_util) or not 0 <= mem_util <= 100:
+                    mem_util = None
+            except ValueError:
+                mem_util = None
             if all(math.isfinite(v) for v in (util, used, total)):
-                readings.append({'uuid': values[1], 'util': util, 'used': used, 'total': total})
+                readings.append({'uuid': values[1], 'util': util, 'mem_util': mem_util,
+                                 'used': used, 'total': total})
         except ValueError:
             continue
     if output is not None and not readings:

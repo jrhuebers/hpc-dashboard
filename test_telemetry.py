@@ -171,7 +171,7 @@ class TelemetryTests(unittest.TestCase):
 
     def sample(self, node='node01', timestamp=100, **values):
         sample = dict(time=timestamp, cpu_cores=2, ram_mib=1024,
-                      gpus=[dict(uuid=node, util=50, used=1024, total=2048)])
+                      gpus=[dict(uuid=node, util=50, mem_util=20, used=1024, total=2048)])
         sample.update(values)
         t.atomic_json(self.directory() / f'sample-{node}.json', sample)
 
@@ -295,7 +295,7 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual({}, cache)
 
     def test_gpu_exact_allocation_ids_and_uuid(self):
-        output = '0, GPU-a, 20, 100, 1000\n1, GPU-b, 70, 200, 1000\n'
+        output = '0, GPU-a, 20, 10, 100, 1000\n1, GPU-b, 70, 30, 200, 1000\n'
         with patch.dict(os.environ, {'SLURM_STEP_GPUS': '', 'SLURM_JOB_GPUS': '1', 'CUDA_VISIBLE_DEVICES': '0'}), \
                 patch.object(t, 'nvidia_query', return_value=(output, {'status': 'ok'})), \
                 patch.object(t, 'process_gpu_uuids', return_value=({'GPU-b'}, 'verified process contexts')):
@@ -307,7 +307,7 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual('GPU-a', t.gpu_sample()[0]['uuid'])
 
     def test_step_gpu_precedence_and_diagnostics(self):
-        output = '0, GPU-a, 20, 100, 1000\n1, GPU-b, 70, 200, 1000\n'
+        output = '0, GPU-a, 20, 10, 100, 1000\n1, GPU-b, 70, 30, 200, 1000\n'
         detail = {}
         with patch.dict(os.environ, {'SLURM_STEP_GPUS': '1', 'SLURM_JOB_GPUS': '0',
                                      'CUDA_VISIBLE_DEVICES': '0', 'SECRET': 'hidden'}), \
@@ -318,6 +318,50 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(['1'], detail['allowed_ids'])
         self.assertNotIn('hidden', json.dumps(detail))
         self.assertEqual({'0', '1', '2', 'GPU-a'}, t.gpu_ids('0-2,GPU-a'))
+
+    def test_gpu_memory_activity_parser_handles_unavailable_independently(self):
+        for value, expected in [('17', 17), ('0', 0), ('N/A', None), ('nan', None), ('101', None)]:
+            with self.subTest(value=value), \
+                    patch.dict(os.environ, {'SLURM_STEP_GPUS': 'GPU-a'}), \
+                    patch.object(t, 'nvidia_query', return_value=(
+                        f'0, GPU-a, 50, {value}, 100, 1000\n', {'status': 'ok'})):
+                sample = t.gpu_sample()
+                self.assertEqual(expected, sample[0]['mem_util'])
+                self.assertEqual(50, sample[0]['util'])
+                self.assertEqual(100, sample[0]['used'])
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run', return_value='')
+    def test_memory_activity_averaged_and_retained_independently(self, run, launch):
+        def devices(node, memory):
+            return [dict(uuid=node, util=50, mem_util=memory, used=1024, total=2048)]
+        self.sample('node01', gpus=devices('node01', 10))
+        self.sample('node02', gpus=devices('node02', 30))
+        telemetry = t.Telemetry('me')
+        allocation = job(nodes='node[01-02]')
+        self.assertIn('Mem activity 20%', self.fetch_at(telemetry, 100, allocation))
+        self.sample('node01', timestamp=101, gpus=devices('node01', None))
+        self.sample('node02', timestamp=101, gpus=devices('node02', 0))
+        status = self.fetch_at(telemetry, 101, allocation)
+        self.assertIn('Mem activity 5% (stale, 1s old)', status)
+        self.assertTrue(status.endswith('(2/2 nodes)'))  # Other GPU measurements are current.
+        for node in ('node01', 'node02'):
+            self.sample(node, timestamp=102, gpus=devices(node, 0))
+        status = self.fetch_at(telemetry, 102, allocation)
+        self.assertIn('Mem activity 0%', status)
+        self.assertNotIn('stale', status)
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run', return_value='')
+    def test_old_sample_without_memory_activity_keeps_gpu_readings(self, run, launch):
+        self.sample(gpus=[dict(uuid='node01', util=50, used=1024, total=2048)])
+        status = self.fetch_at(t.Telemetry('me'), 100)
+        self.assertIn('GPU device 50% · Mem activity unavailable · VRAM', status)
+
+    def test_nvidia_query_requests_memory_activity(self):
+        with patch.object(t.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='')) as run:
+            t.nvidia_query()
+        self.assertIn('utilization.memory', run.call_args.args[0][1])
 
     def test_gpu_failures_classified(self):
         with patch.dict(os.environ, {'SLURM_STEP_GPUS': 'GPU-a'}), \

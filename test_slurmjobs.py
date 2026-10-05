@@ -383,13 +383,13 @@ class RenderingTests(unittest.TestCase):
 
     def test_usage_cpu_and_gpu_share_label_on_separate_lines(self):
         job = s.from_json(raw_job(tres_alloc_str='cpu=8,mem=8G,gres/gpu=1'), 1000)
-        usage = 'CPU 2/8 cores · cgroup RAM 1 GiB · GPU device 50% · VRAM 2/24 GiB'
+        usage = 'CPU 2/8 cores · cgroup RAM 1 GiB · GPU device 50% · Mem activity 20% · VRAM 2/24 GiB'
         for compact in (False, True):
             group = s.render([job], 'me', width=120, compact=compact, usage={job.id: usage})
             lines = [line.plain for line in group.renderables]
             index = next(i for i, line in enumerate(lines) if line.startswith('  Usage'))
             self.assertEqual(lines[index], '  Usage      CPU 2/8 cores · cgroup RAM 1 GiB')
-            self.assertEqual(lines[index + 1], ' ' * 13 + 'GPU device 50% · VRAM 2/24 GiB')
+            self.assertEqual(lines[index + 1], ' ' * 13 + 'GPU device 50% · Mem activity 20% · VRAM 2/24 GiB')
         lines = s.wrap_lines(list(s.job_lines(job, usage=usage)), 40)
         gpu = next(i for i, line in enumerate(lines) if 'GPU device' in line.plain)
         self.assertTrue(all(line.plain.startswith(' ' * 13) for line in lines[gpu:]))
