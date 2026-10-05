@@ -457,6 +457,36 @@ class RenderingTests(unittest.TestCase):
         self.assertTrue(all(line.plain.startswith(' ' * 13) for line in lines[gpu:]))
         self.assertTrue(all(len(line.plain) <= 40 for line in lines))
 
+    def test_title_status_right_aligned_for_own_and_other_jobs(self):
+        own = s.from_json(raw_job(name='short'), 1000)
+        other = s.from_json(raw_job(job_id=43, name='other job', user_name='other'), 1000)
+        for job in (own, other):
+            job.steps_queried = True
+            job.step_count = 3
+        for width in (60, 100):
+            lines = list(s.render([own, other], 'me', width=width).renderables)
+            titles = [line for line in lines if line.plain.endswith('RUNNING · 3 running steps')]
+            self.assertEqual(len(titles), 2)
+            self.assertTrue(all(line.cell_len == width for line in titles))
+            self.assertTrue(titles[0].plain.startswith('42 · short'))
+            self.assertTrue(titles[1].plain.startswith('  43 · other job'))
+
+    def test_right_aligned_status_preserves_long_and_unicode_names(self):
+        job = s.from_json(raw_job(name='長い名前-' * 20), 1000)
+        job.steps_queried = True
+        job.step_count = 3
+        for width in (80, 28, 20):
+            lines = s.wrap_lines(list(s.job_lines(job, width=width)), width)
+            self.assertTrue(all(line.cell_len <= width for line in lines))
+            title_end = next(i for i, line in enumerate(lines) if 'Comment' in line.plain)
+            titles = lines[:title_end]
+            combined = ''.join(line.plain.strip() for line in titles)
+            combined = combined.replace('RUNNING · 3 running steps', '')
+            self.assertIn(job.name, combined)
+            if width >= len('RUNNING · 3 running steps'):
+                status = next(line for line in titles if 'RUNNING · 3 running steps' in line.plain)
+                self.assertEqual(status.cell_len, width)
+
     def test_cpu_only_usage_omits_no_gpu_line(self):
         job = s.from_json(raw_job(), 1000)
         usage = 'CPU 1/8 cores · cgroup RAM 1 GiB · no GPU'

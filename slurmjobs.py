@@ -275,17 +275,30 @@ class Queue:
             return None
 
 
-def job_lines(job, indent='', compact=False, usage=None):
+def job_lines(job, indent='', compact=False, usage=None, width=None):
     state_color = 'green' if job.state == 'RUNNING' else 'yellow' if job.state == 'PENDING' else 'cyan'
-    # Continuation indentation is preserved even for very long names/comments.
-    title = Text(indent + job.id + ' · ' + job.name + '  ', style='bold', overflow='fold')
-    title.append(job.state, style=state_color)
+    # Reserve a right-hand status column; preserve complete names on the left.
+    title = Text(indent + job.id + ' · ' + job.name, style='bold', overflow='fold')
+    status = Text('')
+    status.append(job.state, style=state_color)
     if job.steps_queried:
         if job.step_count is None:
-            title.append(' · running steps ?', style=GREY)
+            status.append(' · running steps ?', style=GREY)
         else:
-            title.append(f' · {job.step_count} running step' + ('' if job.step_count == 1 else 's'), style=GREY)
-    yield title
+            status.append(f' · {job.step_count} running step' + ('' if job.step_count == 1 else 's'), style=GREY)
+    if width is None or status.cell_len > width:
+        yield title + Text('  ') + status
+    else:
+        available = width - status.cell_len - 2
+        if available > len(indent) + 2:
+            titles = wrap_lines([title], available)
+            titles[0].pad_right(width - status.cell_len - titles[0].cell_len)
+            yield titles[0] + status
+            yield from titles[1:]
+        else:
+            # Narrow terminals: put the right-aligned status on its own line.
+            yield title
+            yield Text(' ' * (width - status.cell_len), style='bold') + status
     def detail(label, value):
         text = Text(indent + '  ' + f'{label:<11}', style=GREY, overflow='fold')
         text.append(value, style='default')
@@ -322,7 +335,7 @@ def wrap_lines(lines, width):
         indent = len(plain) - len(plain.lstrip(' '))
         detail = plain.lstrip().startswith(('Comment ', 'Location ', 'Resources ', 'Time ', 'Waiting ', 'Usage '))
         prefix = indent + 11 if detail else indent + 2
-        if not plain or len(plain) <= width and '\n' not in plain:
+        if not plain or line.cell_len <= width and '\n' not in plain:
             result.append(line)
             continue
         if detail:
@@ -347,7 +360,7 @@ def render(jobs, user, compact=False, width=80, usage=None):
         return sorted(jobs, key=lambda j: (0 if j.state == 'RUNNING' else 1 if j.state == 'PENDING' else 2, j.id))
     lines = [Text(f'MY JOBS · {user} · {len(own)} jobs', style='bold #ffffff on #000000')]
     for job in sort(own):
-        lines.extend(job_lines(job, compact=compact, usage=(usage or {}).get(job.id)))
+        lines.extend(job_lines(job, compact=compact, usage=(usage or {}).get(job.id), width=width))
     if not own:
         lines.append(Text('  No active jobs.', style=GREY))
     if others:
@@ -355,7 +368,7 @@ def render(jobs, user, compact=False, width=80, usage=None):
         for name, group in sorted(others.items()):
             lines.append(Text(name, style='bold #ffffff on #000000'))
             for job in sort(group):
-                lines.extend(job_lines(job, indent='  ', compact=compact))
+                lines.extend(job_lines(job, indent='  ', compact=compact, width=width))
     return Group(*wrap_lines(lines, width))
 
 
