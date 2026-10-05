@@ -85,6 +85,51 @@ class TelemetryTests(unittest.TestCase):
             path.write_text(content)
             self.assertEqual({}, t.read_json(path))
 
+    @patch.object(t, 'cleanup')
+    def test_empty_queue_still_runs_expiry_cleanup(self, cleanup):
+        self.assertEqual({}, t.Telemetry('me').fetch([]))
+        cleanup.assert_called_once_with(self.root)
+
+    @patch.object(t, 'atomic_json')
+    @patch.object(t, 'gpu_sample', return_value=[])
+    @patch.object(t, 'cgroup_sample', return_value=(1, 1024))
+    @patch.object(t, 'reload_collector')
+    @patch.object(t, 'source_version', return_value=(1, 1))
+    @patch.object(t.time, 'sleep', side_effect=RuntimeError('stop after one sample'))
+    @patch.object(t.socket, 'gethostname', return_value='node01.example.org')
+    def test_collector_uses_slurm_node_name_for_sample_path(self, hostname, sleep, version, reload, cgroup, gpu, publish):
+        self.directory()
+        with patch.dict(os.environ, {'SLURMD_NODENAME': 'node01'}):
+            with self.assertRaisesRegex(RuntimeError, 'stop after one sample'):
+                t.collector('123')
+        self.assertEqual('sample-node01.json', publish.call_args.args[0].name)
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t.Telemetry, '_accounting', return_value={})
+    @patch.object(t, 'cleanup')
+    def test_sample_published_during_refresh_is_not_future(self, cleanup, accounting, launch):
+        clock = [100]
+        self.sample(timestamp=101)
+        original = t.read_sample
+        def slow_read(path):
+            clock[0] = 102
+            return original(path)
+        with patch.object(t.time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(t, 'read_sample', side_effect=slow_read):
+            status = t.Telemetry('me').fetch([job(nodes='node01')])['123']
+        self.assertIn('GPU device 50%', status)
+        self.assertNotIn('stale', status)
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t.Telemetry, '_accounting', return_value={})
+    def test_small_node_clock_skew_accepted_large_future_rejected(self, accounting, launch):
+        self.sample(timestamp=100.5)
+        status = self.fetch_at(t.Telemetry('me'), 100)
+        self.assertIn('GPU device 50%', status)
+        self.sample(timestamp=105)
+        status = self.fetch_at(t.Telemetry('me'), 100)
+        self.assertIn('GPU unavailable', status)
+
     def test_hostlist_count(self):
         for text, expected in [('n1', 1), ('n[01-03,08]', 4),
                                ('n[01-03],m[1-2]', 5), ('r[1-2]n[1-3]', 6)]:
@@ -94,7 +139,7 @@ class TelemetryTests(unittest.TestCase):
     @patch.object(t, 'run', return_value='123.batch|2|00:10|1G\n123.extern|1|00:10|8G')
     def test_accounting_throttled_and_sample_aggregation(self, run, launch):
         path = self.directory()
-        for host in ('n1', 'n2'):
+        for host in ('node01', 'node02'):
             t.atomic_json(path / f'sample-{host}.json',
                           {'time': 100, 'cpu_cores': 2, 'ram_mib': 1024,
                            'gpus': [{'uuid': host, 'util': 50, 'used': 1024, 'total': 2048}]})
@@ -113,15 +158,141 @@ class TelemetryTests(unittest.TestCase):
     @patch.object(t, 'run', return_value='')
     def test_partial_and_stale_samples_not_reported_as_full_job(self, run, launch):
         path = self.directory()
-        t.atomic_json(path / 'sample-n1.json',
+        t.atomic_json(path / 'sample-node01.json',
                       {'time': 100, 'cpu_cores': 2, 'ram_mib': 1024, 'gpus': []})
         with patch.object(t.time, 'time', return_value=100):
             status = t.Telemetry('me').fetch([job()])['123']
         self.assertIn('CPU unavailable', status)
         self.assertNotIn('cgroup RAM', status)
         with patch.object(t.time, 'time', return_value=200):
-            status = t.Telemetry('me').fetch([job(nodes='n1')])['123']
+            status = t.Telemetry('me').fetch([job(nodes='node01')])['123']
+        self.assertIn('CPU 2.0/8 cores', status)
+        self.assertIn('(stale, 100s old)', status)
+
+    def sample(self, node='node01', timestamp=100, **values):
+        sample = dict(time=timestamp, cpu_cores=2, ram_mib=1024,
+                      gpus=[dict(uuid=node, util=50, used=1024, total=2048)])
+        sample.update(values)
+        t.atomic_json(self.directory() / f'sample-{node}.json', sample)
+
+    def fetch_at(self, telemetry, timestamp, allocation=None):
+        with patch.object(t.time, 'time', return_value=timestamp):
+            return telemetry.fetch([allocation or job(nodes='node01')])['123']
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run', return_value='123.batch|2|00:10|8G')
+    def test_corrupt_and_nfs_read_error_retain_all_metrics(self, run, launch):
+        self.sample()
+        telemetry = t.Telemetry('me')
+        self.fetch_at(telemetry, 100)
+        (self.directory() / 'sample-node01.json').write_text('{')
+        status = self.fetch_at(telemetry, 101)
+        for text in ('CPU 2.0/8 cores (25%) (stale, 1s old)',
+                     'cgroup RAM 1.0 GiB (stale, 1s old)',
+                     'GPU device 50%', '(1/1 nodes) (stale, 1s old)'):
+            self.assertIn(text, status)
+        self.sample(timestamp=102)
+        read_text = Path.read_text
+        def fail_sample(path, *args, **kwargs):
+            if path.name.startswith('sample-'):
+                raise OSError(121, 'Remote I/O error')
+            return read_text(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', fail_sample):
+            status = self.fetch_at(telemetry, 102)
+        self.assertIn('cgroup RAM 1.0 GiB (stale, 2s old)', status)
+        self.assertNotIn('RSS', status)
+        self.assertNotIn('unavailable', status)
+        self.assertNotIn('stale', self.fetch_at(telemetry, 102))
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run', return_value='')
+    def test_metric_warmup_and_gpu_failure_are_independent(self, run, launch):
+        self.sample()
+        telemetry = t.Telemetry('me')
+        self.fetch_at(telemetry, 100)
+        self.sample(timestamp=101, cpu_cores=None, ram_mib=2048, gpus=[])
+        status = self.fetch_at(telemetry, 101)
+        self.assertIn('CPU 2.0/8 cores (25%) (stale, 1s old)', status)
+        self.assertIn('cgroup RAM 2.0 GiB ·', status)
+        self.assertIn('(1/1 nodes) (stale, 1s old)', status)
+        self.sample(timestamp=102, ram_mib=None,
+                    gpus=[dict(uuid='node01', util=0, used=0, total=2048)])
+        status = self.fetch_at(telemetry, 102)
+        self.assertIn('CPU 2.0/8 cores (25%) ·', status)
+        self.assertIn('cgroup RAM 2.0 GiB (stale, 1s old)', status)
+        self.assertIn('GPU device 0%', status)
+        self.assertTrue(status.endswith('(1/1 nodes)'))
+        self.sample(timestamp=103, cpu_cores=3, ram_mib=3072, gpus=None)
+        status = self.fetch_at(telemetry, 103)
+        self.assertIn('CPU 3.0/8 cores', status)
+        self.assertIn('cgroup RAM 3.0 GiB ·', status)
+        self.assertIn('GPU device 0%', status)
+        self.assertTrue(status.endswith('(1/1 nodes) (stale, 1s old)'))
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run', return_value='123.batch|2|00:10|8G')
+    def test_aged_samples_and_complete_cached_coverage(self, run, launch):
+        self.sample()
+        self.sample('node02', timestamp=99)
+        self.sample('obsolete', timestamp=100)
+        telemetry = t.Telemetry('me')
+        allocation = job()
+        self.fetch_at(telemetry, 100, allocation)
+        self.sample(timestamp=106, ram_mib=2048)
+        (self.directory() / 'sample-node02.json').unlink()
+        status = self.fetch_at(telemetry, 106, allocation)
+        self.assertIn('CPU 4.0/8 cores (50%) (stale, 7s old)', status)
+        self.assertIn('cgroup RAM 3.0 GiB (stale, 7s old)', status)
+        self.assertIn('(2/2 nodes) (stale, 7s old)', status)
+        self.assertIn('VRAM 2.0/4.0 GiB', status)
+        status = self.fetch_at(telemetry, 120, allocation)
+        self.assertIn('cgroup RAM 3.0 GiB (stale, 21s old)', status)
+        self.assertNotIn('RSS', status)
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run', return_value='')
+    def test_cache_launch_and_touch_errors_do_not_erase_readings(self, run, launch):
+        self.sample()
+        telemetry = t.Telemetry('me')
+        self.fetch_at(telemetry, 100)
+        self.sample(timestamp=101, ram_mib=2048)
+        launch.side_effect = OSError('launch cache failure')
+        with patch.object(Path, 'touch', side_effect=OSError('touch failure')):
+            status = self.fetch_at(telemetry, 101)
+        self.assertIn('cgroup RAM 2.0 GiB', status)
+        self.assertNotIn('stale', status)
+        with patch.object(t, 'cache_root', side_effect=OSError('cache failure')):
+            status = self.fetch_at(telemetry, 102)
+        self.assertIn('cgroup RAM 2.0 GiB (stale, 1s old)', status)
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run')
+    def test_accounting_failure_preserves_timestamped_readings(self, run, launch):
+        run.side_effect = ['123.batch|1|00:10|1G', '123.batch|1|00:30|2G', None, '']
+        telemetry = t.Telemetry('me')
+        self.fetch_at(telemetry, 100)
+        status = self.fetch_at(telemetry, 110)
+        self.assertIn('CPU 2.0/8 cores', status)
+        self.assertIn('RSS 2.0 GiB', status)
+        for timestamp in (120, 121, 130):
+            status = self.fetch_at(telemetry, timestamp)
+            self.assertIn(f'RSS 2.0 GiB (stale, {timestamp - 110}s old)', status)
+            self.assertIn(f'CPU 2.0/8 cores (25%) (stale, {timestamp - 110}s old)', status)
+        self.assertEqual(4, run.call_count)
+
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run', return_value='')
+    def test_removed_jobs_and_profile_changes_prune_caches(self, run, launch):
+        self.sample()
+        telemetry = t.Telemetry('me')
+        self.fetch_at(telemetry, 100)
+        status = self.fetch_at(telemetry, 101, job(nodes='node02'))
         self.assertIn('CPU unavailable', status)
+        self.assertIn('GPU unavailable', status)
+        telemetry.fetch([])
+        for cache in (telemetry.previous, telemetry.accounting, telemetry.metrics,
+                      telemetry.fallback, telemetry.profiles):
+            self.assertEqual({}, cache)
 
     def test_gpu_exact_allocation_ids_and_uuid(self):
         output = '0, GPU-a, 20, 100, 1000\n1, GPU-b, 70, 200, 1000\n'
@@ -201,10 +372,13 @@ class TelemetryTests(unittest.TestCase):
         for content in ('{', '{}', '[]'):
             path.write_text(content)
             self.assertEqual(t.MAX_STARTS, t.read_meta(path)['starts'])
-        for content in ('{"time": "bad"}', '{"time": NaN}',
-                        '{"time": 1, "cpu_cores": "bad"}', '{"time": 1, "gpus": [1]}'):
+        for content in ('{"time": "bad"}', '{"time": NaN}'):
             path.write_text(content)
             self.assertEqual({}, t.read_sample(path))
+
+        path.write_text('{"time": 1, "cpu_cores": "bad", "ram_mib": 1024, "gpus": [1]}')
+        self.assertEqual(dict(time=1, cpu_cores=None, ram_mib=1024, gpus=[]),
+                         t.read_sample(path))
 
     def test_lock_only_cleanup_has_no_scheduler_query(self):
         path = self.directory()

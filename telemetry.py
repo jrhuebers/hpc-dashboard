@@ -26,6 +26,7 @@ import time
 NAME = 'sj-telemetry'
 STALE = 45
 SAMPLE_STALE = 5
+CLOCK_SKEW = 1  # Small clock offsets between compute and dashboard hosts.
 TTL = 3600
 MAX_STARTS = 2
 ACCOUNTING_INTERVAL = 10
@@ -73,19 +74,17 @@ def read_sample(path):
     sample = read_json(path)
     if not finite_number(sample.get('time')):
         return {}
+    # A failed metric must not discard independently valid measurements.
     for field in ('cpu_cores', 'ram_mib'):
         value = sample.get(field)
         if value is not None and (not finite_number(value) or value < 0):
-            return {}
+            sample[field] = None
     gpus = sample.get('gpus', [])
-    if not isinstance(gpus, list):
-        return {}
-    for gpu in gpus:
-        if not isinstance(gpu, dict) or not isinstance(gpu.get('uuid'), str):
-            return {}
-        if any(not finite_number(gpu.get(key)) or gpu[key] < 0
-               for key in ('util', 'used', 'total')):
-            return {}
+    if (not isinstance(gpus, list) or
+            any(not isinstance(gpu, dict) or not isinstance(gpu.get('uuid'), str) or
+                any(not finite_number(gpu.get(key)) or gpu[key] < 0
+                    for key in ('util', 'used', 'total')) for gpu in gpus)):
+        sample['gpus'] = []
     return sample
 
 
@@ -153,6 +152,26 @@ def node_count(nodes):
     return max(1, total)
 
 
+def node_names(nodes):
+    """Expand hostlists; obsolete node files must not inflate GPU coverage."""
+    names = set()
+    def expand(text):
+        match = re.search(r'\[([^]]+)\]', text)
+        if not match:
+            names.add(re.sub(r'[^\w.-]', '_', text))
+            return
+        for entry in match[1].split(','):
+            ends = entry.split('-')
+            values = ([str(i).zfill(len(ends[0]))
+                       for i in range(int(ends[0]), int(ends[1]) + 1)]
+                      if len(ends) == 2 else [entry])
+            for value in values:
+                expand(text[:match.start()] + value + text[match.end():])
+    for part in re.split(r',(?=[^\]]*(?:\[|$))', nodes):
+        expand(part)
+    return names
+
+
 def seconds(value):
     days, _, clock = value.rpartition('-')
     pieces = clock.split(':')
@@ -177,6 +196,11 @@ class Telemetry:
         self.previous = {}
         self.accounting = {}
         self.accounting_at = 0
+        self.accounting_checked_at = 0
+        self.accounting_confirmed = False
+        self.metrics = {}
+        self.fallback = {}
+        self.profiles = {}
 
     def _launch(self, job, directory):
         with lock(directory / 'launch.lock') as acquired:
@@ -216,7 +240,7 @@ class Telemetry:
                       '--format=JobID,NTasks,AveCPU,AveRSS'], self.timeout)
         totals = {}
         if output is None:
-            return totals
+            return None
         for line in output.splitlines():
             fields = line.split('|')
             if len(fields) < 4:
@@ -236,69 +260,133 @@ class Telemetry:
     def fetch(self, jobs):
         jobs = [j for j in jobs if j.user == self.user and j.state == 'RUNNING'
                 and JOB_ID.fullmatch(j.id)]
+        active = {j.id for j in jobs}
+        caches = (self.previous, self.accounting, self.metrics, self.fallback, self.profiles)
+        for cache in caches:
+            for key in list(cache):
+                if key not in active:
+                    del cache[key]
+        for job in jobs:
+            profile = (job.nodes, job.cpus, job.memory, job.gpu)
+            if self.profiles.get(job.id, profile) != profile:
+                for cache in caches:
+                    cache.pop(job.id, None)
+            self.profiles[job.id] = profile
+        now = time.time()
+        root = None
         try:
             root = cache_root()
             cleanup(root)
         except OSError:
-            return {j.id: 'utilization unavailable (cache)' for j in jobs}
+            pass
         if not jobs:
             return {}
-        now = time.time()
-        if now - self.accounting_at >= ACCOUNTING_INTERVAL:
-            self.accounting = self._accounting(jobs)
-            self.accounting_at = now
-        accounting = self.accounting
+        if now - self.accounting_checked_at >= ACCOUNTING_INTERVAL:
+            accounting = self._accounting(jobs)
+            self.accounting_checked_at = now
+            self.accounting_confirmed = accounting is not None
+            if accounting is not None:
+                self.accounting = accounting
+                self.accounting_at = now
         result = {}
         for job in jobs:
-            directory = root / job.id
-            try:
-                directory.mkdir(mode=0o700, exist_ok=True)
-                if directory.is_symlink():
-                    raise OSError('unsafe job directory')
-                self._launch(job, directory)
-                # Touch without modifying supervisor-owned metadata.
-                (directory / 'seen').touch(mode=0o600)
-                samples = [read_sample(p) for p in directory.glob('sample-*.json')]
-                samples = [s for s in samples if s]
-            except OSError:
-                result[job.id] = 'utilization unavailable (cache)'
-                continue
-            steps = accounting.get(job.id, {})
+            nodes = node_names(job.nodes)
+            cached = self.metrics.setdefault(job.id, {})
+            samples = {}
+            if root is not None:
+                directory = root / job.id
+                safe = False
+                try:
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    safe = not directory.is_symlink()
+                except OSError:
+                    pass
+                if safe:
+                    # Launch/touch errors must not suppress existing measurements.
+                    for operation in (lambda: self._launch(job, directory),
+                                      lambda: (directory / 'seen').touch(mode=0o600)):
+                        try:
+                            operation()
+                        except OSError:
+                            pass
+                    for node in nodes:
+                        samples[node] = read_sample(directory / f'sample-{node}.json')
+            # Sampling continues while scheduler/NFS calls run. Compare timestamps
+            # with the clock AFTER reading, not the start of this refresh.
+            now = time.time()
+            confirmed = set()
+            for node, sample in samples.items():
+                if not sample or sample['time'] > now + CLOCK_SKEW:
+                    continue
+                metrics = cached.setdefault(node, {})
+                for metric in ('cpu_cores', 'ram_mib', 'gpus'):
+                    value = sample.get(metric)
+                    if value is None or (metric == 'gpus' and not value):
+                        continue
+                    previous = metrics.get(metric)
+                    if previous is None or sample['time'] >= previous[1]:
+                        metrics[metric] = (value, sample['time'])
+                        if now - sample['time'] < SAMPLE_STALE:
+                            confirmed.add((node, metric))
+
+            def retained(label, readings, metric):
+                if any((node, metric) not in confirmed for node, _ in readings):
+                    age = max(0, now - min(value[1] for _, value in readings))
+                    return f'{label} (stale, {age:.0f}s old)'
+                return label
+
+            steps = self.accounting.get(job.id, {})
             previous = self.previous.get(job.id)
-            cpu_label = 'CPU warming up' if steps else 'CPU unavailable'
-            if steps and previous and self.accounting_at > previous[0]:
-                # Only compare surviving steps: completed steps cannot cause negatives.
-                common = steps.keys() & previous[1].keys()
-                if common:
-                    delta = sum(max(0, steps[s][0] - previous[1][s][0]) for s in common)
-                    busy = delta / (self.accounting_at - previous[0])
-                    cpu_label = f'CPU {busy:.1f}/{job.cpus} cores ({100 * busy / max(1, job.cpus):.0f}%)'
+            fallback = self.fallback.setdefault(job.id, {})
             if steps and (not previous or self.accounting_at > previous[0]):
-                self.previous[job.id] = (self.accounting_at, steps, cpu_label)
-            elif previous:
-                cpu_label = previous[2]
-            rss = sum(v[1] for v in steps.values())
-            ram_label = (f'RSS {rss / 1024:.1f} GiB' if steps else 'RSS unavailable')
-            fresh = [s for s in samples if 0 <= now - s.get('time', 0) < SAMPLE_STALE]
-            if len(fresh) == node_count(job.nodes) and all(s.get('cpu_cores') is not None for s in fresh):
-                busy = sum(s['cpu_cores'] for s in fresh)
-                cpu_label = f'CPU {busy:.1f}/{job.cpus} cores ({100 * busy / max(1, job.cpus):.0f}%)'
-            if len(fresh) == node_count(job.nodes) and all(s.get('ram_mib') is not None for s in fresh):
-                ram_label = f'cgroup RAM {sum(s["ram_mib"] for s in fresh) / 1024:.1f} GiB'
-            gpu = [g for s in fresh for g in s.get('gpus', [])]
+                if previous:
+                    common = steps.keys() & previous[1].keys()
+                    if common:
+                        delta = sum(max(0, steps[s][0] - previous[1][s][0]) for s in common)
+                        busy = delta / (self.accounting_at - previous[0])
+                        fallback['cpu'] = (f'CPU {busy:.1f}/{job.cpus} cores '
+                                           f'({100 * busy / max(1, job.cpus):.0f}%)',
+                                           self.accounting_at)
+                fallback['ram'] = (f'RSS {sum(v[1] for v in steps.values()) / 1024:.1f} GiB',
+                                   self.accounting_at)
+                self.previous[job.id] = (self.accounting_at, steps)
+
+            def accounting_label(metric, default):
+                if metric not in fallback:
+                    return default
+                label, timestamp = fallback[metric]
+                if (not self.accounting_confirmed or not steps or
+                        timestamp != self.accounting_at or now - timestamp >= ACCOUNTING_INTERVAL):
+                    label += f' (stale, {max(0, now - timestamp):.0f}s old)'
+                return label
+
+            cpu_label = accounting_label('cpu', 'CPU warming up' if steps else 'CPU unavailable')
+            ram_label = accounting_label('ram', 'RSS unavailable')
+            for metric in ('cpu_cores', 'ram_mib'):
+                readings = [(node, cached[node][metric]) for node in nodes
+                            if metric in cached.get(node, {})]
+                if len(readings) != len(nodes):
+                    continue
+                total = sum(value[0] for _, value in readings)
+                if metric == 'cpu_cores':
+                    label = f'CPU {total:.1f}/{job.cpus} cores ({100 * total / max(1, job.cpus):.0f}%)'
+                    cpu_label = retained(label, readings, metric)
+                else:
+                    ram_label = retained(f'cgroup RAM {total / 1024:.1f} GiB', readings, metric)
+            readings = [(node, cached[node]['gpus']) for node in nodes
+                        if 'gpus' in cached.get(node, {})]
+            gpu = [g for _, value in readings for g in value[0]]
             if job.gpu == 'no GPU':
                 gpu_label = 'no GPU'
             elif gpu:
                 gpu_label = (f'GPU device {sum(g["util"] for g in gpu) / len(gpu):.0f}% · '
                              f'VRAM {sum(g["used"] for g in gpu) / 1024:.1f}/'
                              f'{sum(g["total"] for g in gpu) / 1024:.1f} GiB '
-                             f'({len([s for s in fresh if s.get("gpus")])}/{node_count(job.nodes)} nodes)')
+                             f'({len(readings)}/{len(nodes)} nodes)')
+                gpu_label = retained(gpu_label, readings, 'gpus')
             else:
                 gpu_label = 'GPU unavailable'
             result[job.id] = ' · '.join((cpu_label, ram_label, gpu_label))
-            if samples and not fresh:
-                result[job.id] += ' · samples stale'
-        self.previous = {k: v for k, v in self.previous.items() if k in result}
         return result
 
 
@@ -503,7 +591,7 @@ def reload_collector(version, jobid):
 
 def collector(jobid):
     directory = cache_root() / jobid
-    host = re.sub(r'[^\w.-]', '_', socket.gethostname())
+    host = re.sub(r'[^\w.-]', '_', os.environ.get('SLURMD_NODENAME') or socket.gethostname())
     version = source_version()
     previous = None
     while True:
