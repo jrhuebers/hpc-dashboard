@@ -323,7 +323,7 @@ class RenderingTests(unittest.TestCase):
         self.assertIn(name, joined)
         self.assertIn('[red]' + 'x' * 150 + '[/red]', joined)
         self.assertNotIn('…', joined)
-        self.assertTrue(any(line.plain.startswith(' ' * 15 + 'x') for line in lines))
+        self.assertTrue(any(line.plain.startswith(' ' * 13 + 'x') for line in lines))
 
     def test_grouping_and_state_order(self):
         jobs = [s.from_json(raw_job(job_id=2, job_state=['PENDING']), 1000),
@@ -380,6 +380,28 @@ class RenderingTests(unittest.TestCase):
         self.assertIn('[red]not markup[/red]', joined)
         self.assertNotIn('must not appear', joined)
         self.assertTrue(any(line.plain.startswith(' ' * 13) for line in lines))
+
+    def test_usage_cpu_and_gpu_share_label_on_separate_lines(self):
+        job = s.from_json(raw_job(tres_alloc_str='cpu=8,mem=8G,gres/gpu=1'), 1000)
+        usage = 'CPU 2/8 cores · cgroup RAM 1 GiB · GPU device 50% · VRAM 2/24 GiB'
+        for compact in (False, True):
+            group = s.render([job], 'me', width=120, compact=compact, usage={job.id: usage})
+            lines = [line.plain for line in group.renderables]
+            index = next(i for i, line in enumerate(lines) if line.startswith('  Usage'))
+            self.assertEqual(lines[index], '  Usage      CPU 2/8 cores · cgroup RAM 1 GiB')
+            self.assertEqual(lines[index + 1], ' ' * 13 + 'GPU device 50% · VRAM 2/24 GiB')
+        lines = s.wrap_lines(list(s.job_lines(job, usage=usage)), 40)
+        gpu = next(i for i, line in enumerate(lines) if 'GPU device' in line.plain)
+        self.assertTrue(all(line.plain.startswith(' ' * 13) for line in lines[gpu:]))
+        self.assertTrue(all(len(line.plain) <= 40 for line in lines))
+
+    def test_cpu_only_usage_omits_no_gpu_line(self):
+        job = s.from_json(raw_job(), 1000)
+        usage = 'CPU 1/8 cores · cgroup RAM 1 GiB · no GPU'
+        group = s.render([job], 'me', width=120, usage={job.id: usage})
+        lines = [line.plain for line in group.renderables]
+        usage_lines = lines[next(i for i, line in enumerate(lines) if line.startswith('  Usage')):]
+        self.assertEqual(usage_lines, ['  Usage      CPU 1/8 cores · cgroup RAM 1 GiB'])
 
     def test_watch_default_one_second(self):
         with patch('slurmjobs.sys.argv', ['sj', '--help']):

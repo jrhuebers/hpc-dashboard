@@ -252,7 +252,14 @@ def job_lines(job, indent='', compact=False, usage=None):
         yield detail('Resources', resources)
         yield detail('Time', timing)
     if usage is not None:
-        yield detail('Usage', clean(usage))
+        value = clean(usage)
+        if job.gpu == 'no GPU':
+            value = value.removesuffix(' · no GPU')
+        else:
+            cpu_ram, separator, gpu_vram = value.partition(' · GPU ')
+            if separator:
+                value = cpu_ram + '\nGPU ' + gpu_vram
+        yield detail('Usage', value)
     if job.state == 'PENDING' and job.reason not in ('', 'None', '(null)'):
         yield detail('Waiting', job.reason)
 
@@ -265,7 +272,7 @@ def wrap_lines(lines, width):
         plain = line.plain
         indent = len(plain) - len(plain.lstrip(' '))
         detail = plain.lstrip().startswith(('Comment ', 'Location ', 'Resources ', 'Time ', 'Waiting ', 'Usage '))
-        prefix = indent + 13 if detail else indent + 2
+        prefix = indent + 11 if detail else indent + 2
         if not plain or len(plain) <= width and '\n' not in plain:
             result.append(line)
             continue
