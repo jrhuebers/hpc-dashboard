@@ -215,6 +215,37 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(s.Queue().fetch(), [])
 
 
+class StepTests(unittest.TestCase):
+    @patch('slurmjobs.subprocess.run')
+    def test_batched_step_counts_include_reserved_and_named_steps(self, run):
+        run.return_value = subprocess.CompletedProcess([], 0,
+            '42.batch\n42.extern\n42.1\n42.1\n43_7.0\n44+1.batch\n', '')
+        self.assertEqual(s.Queue().fetch_steps('me'), {'42': 3, '43_7': 1, '44+1': 1})
+        self.assertEqual(run.call_args.args[0],
+                         ['squeue', '--steps', '--noheader', '--format=%i', '--user', 'me'])
+
+    @patch('slurmjobs.subprocess.run')
+    def test_failed_or_malformed_step_query_is_unknown(self, run):
+        for result in (subprocess.CompletedProcess([], 1, '', 'unavailable'),
+                       subprocess.CompletedProcess([], 0, 'malformed\n', '')):
+            run.return_value = result
+            self.assertIsNone(s.Queue().fetch_steps())
+        run.side_effect = subprocess.TimeoutExpired('squeue', 1)
+        self.assertIsNone(s.Queue(timeout=1).fetch_steps())
+
+    @patch('slurmjobs.subprocess.run')
+    def test_empty_steps_are_a_successful_zero(self, run):
+        run.return_value = subprocess.CompletedProcess([], 0, '', '')
+        self.assertEqual({}, s.Queue().fetch_steps())
+
+    def test_title_step_count_plural_and_unknown(self):
+        job = s.from_json(raw_job(), 1000)
+        job.steps_queried = True
+        for count, suffix in ((0, '0 steps'), (1, '1 step'), (3, '3 steps'), (None, 'steps ?')):
+            job.step_count = count
+            self.assertTrue(list(s.job_lines(job))[0].plain.endswith('RUNNING · ' + suffix))
+
+
 class CacheTests(unittest.TestCase):
     @patch('slurmjobs.time.monotonic')
     def test_refresh_throttles_queue_and_updates_elapsed(self, clock):
@@ -222,11 +253,14 @@ class CacheTests(unittest.TestCase):
         job = s.from_json(raw_job(), 1000)
         queue = Mock()
         queue.fetch.return_value = [job]
+        queue.fetch_steps.return_value = {'42': 3}
         cache = s.QueueCache(queue, 'me')
         self.assertEqual(cache.fetch()[0].elapsed, 100)
         clock.return_value = 101
         self.assertEqual(cache.fetch()[0].elapsed, 101)
         self.assertEqual(job.elapsed, 100)
+        self.assertEqual(cache.fetch()[0].step_count, 3)
+        queue.fetch_steps.assert_called_once_with('me')
         queue.fetch.assert_called_once_with('me')
         clock.return_value = 110
         cache.fetch()
@@ -237,6 +271,7 @@ class CacheTests(unittest.TestCase):
         clock.return_value = 100
         queue = Mock()
         queue.fetch.return_value = [s.from_json(raw_job(), 1000)]
+        queue.fetch_steps.return_value = None
         cache = s.QueueCache(queue)
         cache.fetch()
         clock.return_value = 110
@@ -251,6 +286,7 @@ class CacheTests(unittest.TestCase):
     def test_pending_elapsed_not_extrapolated(self, clock):
         queue = Mock()
         queue.fetch.return_value = [s.from_json(raw_job(job_state=['PENDING']), 1000)]
+        queue.fetch_steps.return_value = {}
         cache = s.QueueCache(queue)
         cache.fetch()
         clock.return_value = 105

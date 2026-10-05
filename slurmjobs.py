@@ -124,6 +124,8 @@ class Job:
     limit: float | None
     comment: str = ''
     reason: str = ''
+    step_count: int | None = None
+    steps_queried: bool = False
 
 
 def from_json(raw, now):
@@ -230,12 +232,37 @@ class Queue:
             raise RuntimeError(clean(result.stderr.strip()) or 'squeue failed')
         return [from_text(line) for line in result.stdout.splitlines() if line.strip()]
 
+    def fetch_steps(self, me=None):
+        """One batched query; return None on failure rather than inventing zero."""
+        filters = ['--user', me] if me else []
+        try:
+            result = self.run(['--steps', '--noheader', '--format=%i', *filters])
+        except RuntimeError:
+            return None
+        if result.returncode:
+            return None
+        steps = defaultdict(set)
+        for line in result.stdout.splitlines():
+            step = line.strip()
+            if not step:
+                continue
+            if not re.fullmatch(r'\d+(?:_\d+)?(?:\+\d+)?\.[\w-]+', step):
+                return None
+            job_id = step.rsplit('.', 1)[0]
+            steps[job_id].add(step)
+        return {job_id: len(ids) for job_id, ids in steps.items()}
+
 
 def job_lines(job, indent='', compact=False, usage=None):
     state_color = 'green' if job.state == 'RUNNING' else 'yellow' if job.state == 'PENDING' else 'cyan'
     # Continuation indentation is preserved even for very long names/comments.
     title = Text(indent + job.id + ' · ' + job.name + '  ', style='bold', overflow='fold')
     title.append(job.state, style=state_color)
+    if job.steps_queried:
+        if job.step_count is None:
+            title.append(' · steps ?', style=GREY)
+        else:
+            title.append(f' · {job.step_count} step' + ('' if job.step_count == 1 else 's'), style=GREY)
     yield title
     def detail(label, value):
         text = Text(indent + '  ' + f'{label:<11}', style=GREY, overflow='fold')
@@ -325,7 +352,10 @@ class QueueCache:
         if self.jobs is None or now - self.attempted >= self.interval:
             # Retain the last good queue on failure, and retry at the usual cadence.
             self.attempted = now
-            self.jobs = self.queue.fetch(self.user)
+            jobs = self.queue.fetch(self.user)
+            counts = self.queue.fetch_steps(self.user)
+            self.jobs = [replace(job, step_count=counts.get(job.id, 0) if counts is not None else None,
+                                 steps_queried=True) for job in jobs]
             now = self.fetched = time.monotonic()
         age = max(0, now - self.fetched)
         return [replace(job, elapsed=job.elapsed + age)
