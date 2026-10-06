@@ -544,6 +544,10 @@ class RenderingTests(unittest.TestCase):
             return [line.plain for line in viewport.render(content, 80, height, action).renderables]
         self.assertEqual(show()[:5], ['0', '1', '2', '3', '4'])
         self.assertIn('1-5/30', show()[-1])
+        self.assertEqual(show(action='half-down')[0], '2')
+        self.assertEqual(show(action='half-up')[0], '0')
+        self.assertEqual(show(height=3, action='half-down')[0], '1')
+        self.assertEqual(show(height=3, action='half-up')[0], '0')
         self.assertEqual(show(action='down')[0], '1')
         self.assertEqual(show(action='page-down')[0], '6')
         self.assertEqual(show(action='wheel-down')[0], '9')
@@ -556,8 +560,13 @@ class RenderingTests(unittest.TestCase):
         show(action='end')
         self.assertEqual(show(height=20)[0], '11')
         self.assertEqual(len(show(height=1)), 1)
-        self.assertIs(viewport.render(content, 80, 40), content)
+        fitted = show(height=40)
+        self.assertEqual(fitted[:30], [str(i) for i in range(30)])
+        self.assertEqual(len(fitted), 40)
+        self.assertIn('1-30/30', fitted[-1])
+        self.assertIn('u/d half', fitted[-1])
         self.assertEqual(viewport.offset, 0)
+        self.assertIn('0-0/30', show(height=1)[0])
 
     @patch('slurmjobs.time.monotonic', return_value=100)
     @patch('slurmjobs.os.read')
@@ -568,7 +577,9 @@ class RenderingTests(unittest.TestCase):
         for value, action in [(b'\x1b[B', 'down'), (b'\x1b[5~', 'page-up'),
                               (b'\x1b[F', 'end'), (b'\x1b[H', 'home'),
                               (b'\x1b[<65;10;10M', 'wheel-down'),
-                              (b'\x1b[<64;10;10M', 'wheel-up')]:
+                              (b'\x1b[<64;10;10M', 'wheel-up'),
+                              (b'j', 'down'), (b'k', 'up'),
+                              (b'u', 'half-up'), (b'd', 'half-down')]:
             read.return_value = value
             ready.side_effect = [([3], [], []), ([], [], [])]
             self.assertFalse(keys.wait(1))

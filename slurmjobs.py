@@ -405,13 +405,12 @@ class Viewport:
     def render(self, content, width, height, action=None):
         lines = list(content.renderables)
         height = max(1, height)
-        if len(lines) <= height:
-            self.offset = 0
-            return content
-        size = max(1, height - 1)
-        maximum = max(0, len(lines) - size)
+        size = max(0, height - 1)
+        maximum = max(0, len(lines) - max(1, size))
+        half = max(1, size // 2)
         moves = {'up': -1, 'down': 1, 'page-up': -size,
-                 'page-down': size, 'wheel-up': -3, 'wheel-down': 3}
+                 'page-down': size, 'half-up': -half, 'half-down': half,
+                 'wheel-up': -3, 'wheel-down': 3}
         if action == 'home':
             self.offset = 0
         elif action == 'end':
@@ -419,11 +418,12 @@ class Viewport:
         else:
             self.offset += moves.get(action, 0)
         self.offset = min(maximum, max(0, self.offset))
-        if height == 1:
-            return Group(*lines[self.offset:self.offset + 1])
-        footer = Text(f'{self.offset + 1}-{min(len(lines), self.offset + size)}/{len(lines)} · ↑↓ PgUp/PgDn Home/End · q quit', style=GREY)
+        start = self.offset + 1 if lines and size else 0
+        end = min(len(lines), self.offset + size) if size else 0
+        footer = Text(f'{start}-{end}/{len(lines)} · j/k ↑↓ · u/d half · PgUp/PgDn Home/End · q quit', style=GREY)
         footer.truncate(max(1, width), overflow='ellipsis')
-        return Group(*lines[self.offset:self.offset + size], footer)
+        visible = lines[self.offset:self.offset + size]
+        return Group(*visible, *(Text('') for _ in range(size - len(visible))), footer)
 
 
 class WatchKeys:
@@ -493,6 +493,11 @@ class WatchKeys:
                         action = 'wheel-down' if button & 1 else 'wheel-up'
                 if action:
                     self.action = action
+            letters = {ord('j'): 'down', ord('k'): 'up',
+                       ord('u'): 'half-up', ord('d'): 'half-down'}
+            for letter in plain:
+                if letter in letters:
+                    self.action = letters[letter]
             if self.action:
                 return False
             if time.monotonic() >= deadline:
