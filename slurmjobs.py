@@ -450,19 +450,21 @@ def positive(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Readable Slurm jobs. --usage starts persistent collectors in your jobs. Time is elapsed/limit.')
+    parser = argparse.ArgumentParser(description='Fullscreen Slurm dashboard with usage enabled by default. Collectors persist in your jobs. Time is elapsed/limit.')
     parser.add_argument('--me', action='store_true', help='show only your jobs')
-    parser.add_argument('--watch', action='store_true', help='refresh in place; q, Escape, or Ctrl-C to stop')
+    parser.add_argument('--watch', action=argparse.BooleanOptionalAction, default=None, help='fullscreen refresh (default on terminals); q, Escape, or Ctrl-C to stop; --no-watch for a snapshot')
     parser.add_argument('--interval', type=positive, default=1, help='display refresh in seconds (default: 1; queue queried every 10s)')
-    parser.add_argument('--usage', action='store_true', help='start/reuse persistent CPU/RAM/GPU collectors for your running jobs')
+    parser.add_argument('--usage', action=argparse.BooleanOptionalAction, default=True, help='start/reuse persistent CPU/RAM/GPU collectors for your running jobs (default: enabled; --no-usage for read-only)')
     parser.add_argument('--timeout', type=positive, default=10, help='scheduler query timeout (default: 10)')
     parser.add_argument('--compact', action='store_true', help='combine resources and time')
     parser.add_argument('--no-color', action='store_true', help='disable colors')
     args = parser.parse_args()
     console = Console(no_color=args.no_color or 'NO_COLOR' in os.environ, highlight=False)
     user = getpass.getuser()
+    if args.watch is None:
+        args.watch = console.is_terminal
     if args.watch and not console.is_terminal:
-        parser.error('--watch requires a terminal; omit it for piped output')
+        parser.error('--watch requires a terminal; use --no-watch for piped output')
     queue = QueueCache(Queue(args.timeout), user if args.me else None)
     telemetry = None
     if args.usage:
@@ -485,8 +487,8 @@ def main():
         if not args.watch:
             console.print(initial)
             return 0
-        # No alternate screen: output remains accessible in terminal scrollback.
-        with WatchKeys() as keys, Live(initial, console=console, auto_refresh=False, vertical_overflow='visible') as live:
+        # Alternate screen restores the previous terminal contents on exit.
+        with WatchKeys() as keys, Live(initial, console=console, screen=True, auto_refresh=False, vertical_overflow='ellipsis') as live:
             while True:
                 if keys.wait(args.interval):
                     return 0

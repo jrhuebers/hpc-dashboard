@@ -495,6 +495,47 @@ class RenderingTests(unittest.TestCase):
         usage_lines = lines[next(i for i, line in enumerate(lines) if line.startswith('  Usage')):]
         self.assertEqual(usage_lines, ['  Usage      CPU 1/8 cores · cgroup RAM 1 GiB'])
 
+    def test_cli_defaults_and_overrides(self):
+        cases = [
+            ([], True, True, True),
+            ([], False, False, True),
+            (['--no-watch'], True, False, True),
+            (['--no-usage'], True, True, False),
+            (['--no-watch', '--no-usage'], False, False, False),
+            (['--watch', '--usage'], True, True, True),
+        ]
+        for flags, terminal, watching, usage in cases:
+            with self.subTest(flags=flags, terminal=terminal):
+                with patch.object(s, 'Console') as console, \
+                     patch.object(s, 'QueueCache') as queue, \
+                     patch('telemetry.Telemetry') as telemetry, \
+                     patch.object(s, 'Live') as live, \
+                     patch.object(s, 'WatchKeys') as keys, \
+                     patch.object(s.sys, 'argv', ['sj'] + flags):
+                    console.return_value.is_terminal = terminal
+                    console.return_value.width = 80
+                    queue.return_value.fetch.return_value = []
+                    telemetry.return_value.fetch.return_value = {}
+                    keys.return_value.__enter__.return_value.wait.return_value = True
+                    self.assertEqual(s.main(), 0)
+                    self.assertEqual(telemetry.called, usage)
+                    self.assertEqual(live.called, watching)
+                    if watching:
+                        self.assertTrue(live.call_args.kwargs['screen'])
+                        self.assertEqual(live.call_args.kwargs['vertical_overflow'], 'ellipsis')
+                        console.return_value.print.assert_not_called()
+                    else:
+                        console.return_value.print.assert_called_once()
+
+    def test_explicit_watch_rejects_pipe(self):
+        with patch.object(s, 'Console') as console, \
+             patch.object(s.sys, 'argv', ['sj', '--watch']), \
+             patch('sys.stderr', new=io.StringIO()):
+            console.return_value.is_terminal = False
+            with self.assertRaises(SystemExit) as exc:
+                s.main()
+            self.assertEqual(exc.exception.code, 2)
+
     def test_watch_default_one_second(self):
         with patch('slurmjobs.sys.argv', ['sj', '--help']):
             with patch('sys.stdout', new=io.StringIO()) as output:
