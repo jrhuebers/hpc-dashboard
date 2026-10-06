@@ -514,6 +514,7 @@ class RenderingTests(unittest.TestCase):
                      patch.object(s.sys, 'argv', ['sj'] + flags):
                     console.return_value.is_terminal = terminal
                     console.return_value.width = 80
+                    console.return_value.height = 24
                     queue.return_value.fetch.return_value = []
                     telemetry.return_value.fetch.return_value = {}
                     keys.return_value.__enter__.return_value.wait.return_value = True
@@ -522,7 +523,7 @@ class RenderingTests(unittest.TestCase):
                     self.assertEqual(live.called, watching)
                     if watching:
                         self.assertTrue(live.call_args.kwargs['screen'])
-                        self.assertEqual(live.call_args.kwargs['vertical_overflow'], 'ellipsis')
+                        self.assertEqual(live.call_args.kwargs['vertical_overflow'], 'crop')
                         console.return_value.print.assert_not_called()
                     else:
                         console.return_value.print.assert_called_once()
@@ -535,6 +536,43 @@ class RenderingTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as exc:
                 s.main()
             self.assertEqual(exc.exception.code, 2)
+
+    def test_scroll_viewport(self):
+        content = s.Group(*(s.Text(str(i)) for i in range(30)))
+        viewport = s.Viewport()
+        def show(height=6, action=None):
+            return [line.plain for line in viewport.render(content, 80, height, action).renderables]
+        self.assertEqual(show()[:5], ['0', '1', '2', '3', '4'])
+        self.assertIn('1-5/30', show()[-1])
+        self.assertEqual(show(action='down')[0], '1')
+        self.assertEqual(show(action='page-down')[0], '6')
+        self.assertEqual(show(action='wheel-down')[0], '9')
+        self.assertEqual(show(action='end')[0], '25')
+        self.assertEqual(show(action='down')[0], '25')
+        self.assertEqual(show(action='page-up')[0], '20')
+        self.assertEqual(show(action='wheel-up')[0], '17')
+        self.assertEqual(show(action='home')[0], '0')
+        self.assertEqual(show(action='up')[0], '0')
+        show(action='end')
+        self.assertEqual(show(height=20)[0], '11')
+        self.assertEqual(len(show(height=1)), 1)
+        self.assertIs(viewport.render(content, 80, 40), content)
+        self.assertEqual(viewport.offset, 0)
+
+    @patch('slurmjobs.time.monotonic', return_value=100)
+    @patch('slurmjobs.os.read')
+    @patch('slurmjobs.select.select')
+    def test_navigation_input(self, ready, read, clock):
+        keys = s.WatchKeys()
+        keys.fd = 3
+        for value, action in [(b'\x1b[B', 'down'), (b'\x1b[5~', 'page-up'),
+                              (b'\x1b[F', 'end'), (b'\x1b[H', 'home'),
+                              (b'\x1b[<65;10;10M', 'wheel-down'),
+                              (b'\x1b[<64;10;10M', 'wheel-up')]:
+            read.return_value = value
+            ready.side_effect = [([3], [], []), ([], [], [])]
+            self.assertFalse(keys.wait(1))
+            self.assertEqual(keys.action, action)
 
     def test_watch_default_one_second(self):
         with patch('slurmjobs.sys.argv', ['sj', '--help']):

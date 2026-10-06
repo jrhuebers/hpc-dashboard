@@ -397,8 +397,40 @@ class QueueCache:
                 if job.state == 'RUNNING' else job for job in self.jobs]
 
 
+class Viewport:
+    """Keep a bounded scroll offset across refreshes and terminal resizes."""
+    def __init__(self):
+        self.offset = 0
+
+    def render(self, content, width, height, action=None):
+        lines = list(content.renderables)
+        height = max(1, height)
+        if len(lines) <= height:
+            self.offset = 0
+            return content
+        size = max(1, height - 1)
+        maximum = max(0, len(lines) - size)
+        moves = {'up': -1, 'down': 1, 'page-up': -size,
+                 'page-down': size, 'wheel-up': -3, 'wheel-down': 3}
+        if action == 'home':
+            self.offset = 0
+        elif action == 'end':
+            self.offset = maximum
+        else:
+            self.offset += moves.get(action, 0)
+        self.offset = min(maximum, max(0, self.offset))
+        if height == 1:
+            return Group(*lines[self.offset:self.offset + 1])
+        footer = Text(f'{self.offset + 1}-{min(len(lines), self.offset + size)}/{len(lines)} · ↑↓ PgUp/PgDn Home/End · q quit', style=GREY)
+        footer.truncate(max(1, width), overflow='ellipsis')
+        return Group(*lines[self.offset:self.offset + size], footer)
+
+
 class WatchKeys:
     """Temporary cbreak input; preserve Ctrl-C and always restore the terminal."""
+    def __init__(self, mouse=False):
+        self.mouse = mouse
+        self.action = None
     def __enter__(self):
         self.fd = None
         self.saved = None
@@ -408,11 +440,17 @@ class WatchKeys:
                 self.saved = termios.tcgetattr(fd)
                 self.fd = fd
                 tty.setcbreak(fd)
+                if self.mouse:
+                    sys.stdout.write('\x1b[?1000h\x1b[?1006h')
+                    sys.stdout.flush()
         except (OSError, ValueError, AttributeError, termios.error):
             self.__exit__(None, None, None)
         return self
 
     def __exit__(self, *exc):
+        if self.mouse and self.fd is not None:
+            sys.stdout.write('\x1b[?1006l\x1b[?1000l')
+            sys.stdout.flush()
         if self.fd is not None and self.saved is not None:
             try:
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
@@ -421,6 +459,7 @@ class WatchKeys:
         self.fd = None
 
     def wait(self, interval):
+        self.action = None
         if self.fd is None:
             time.sleep(interval)
             return False
@@ -434,10 +473,28 @@ class WatchKeys:
                 return True  # Input terminal closed.
             if b'\x1b' in data and select.select([self.fd], [], [], 0.03)[0]:
                 data += os.read(self.fd, 1024)
-            # Ignore complete arrow/function-key sequences; standalone Esc quits.
-            data = re.sub(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|O.)', b'', data)
-            if b'q' in data or b'\x1b' in data:
+            sequences = re.findall(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|O.)', data)
+            plain = re.sub(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|O.)', b'', data)
+            if b'q' in plain or b'\x1b' in plain:
                 return True
+            actions = {b'\x1b[A': 'up', b'\x1b[B': 'down',
+                       b'\x1bOA': 'up', b'\x1bOB': 'down',
+                       b'\x1b[5~': 'page-up', b'\x1b[6~': 'page-down',
+                       b'\x1b[H': 'home', b'\x1b[F': 'end',
+                       b'\x1bOH': 'home', b'\x1bOF': 'end',
+                       b'\x1b[1~': 'home', b'\x1b[4~': 'end',
+                       b'\x1b[7~': 'home', b'\x1b[8~': 'end'}
+            for sequence in sequences:
+                action = actions.get(sequence)
+                wheel = re.fullmatch(rb'\x1b\[<(\d+);\d+;\d+M', sequence)
+                if wheel:
+                    button = int(wheel[1])
+                    if button & 64:
+                        action = 'wheel-down' if button & 1 else 'wheel-up'
+                if action:
+                    self.action = action
+            if self.action:
+                return False
             if time.monotonic() >= deadline:
                 return False
 
@@ -488,16 +545,22 @@ def main():
             console.print(initial)
             return 0
         # Alternate screen restores the previous terminal contents on exit.
-        with WatchKeys() as keys, Live(initial, console=console, screen=True, auto_refresh=False, vertical_overflow='ellipsis') as live:
+        viewport = Viewport()
+        with WatchKeys(mouse=True) as keys, Live(viewport.render(initial, console.width, console.height), console=console, screen=True, auto_refresh=False, vertical_overflow='crop') as live:
+            next_refresh = time.monotonic() + args.interval
+            error = []
             while True:
-                if keys.wait(args.interval):
+                if keys.wait(max(0, next_refresh - time.monotonic())):
                     return 0
-                try:
-                    live.update(frame(), refresh=True)
-                except (RuntimeError, ValueError, TypeError, KeyError) as exc:
-                    live.update(Group(initial, Text('Refresh failed: ' + clean(exc), style='red')), refresh=True)
-                else:
-                    initial = live.renderable
+                if time.monotonic() >= next_refresh:
+                    try:
+                        initial = frame()
+                        error = []
+                    except (RuntimeError, ValueError, TypeError, KeyError) as exc:
+                        error = wrap_lines([Text('Refresh failed: ' + clean(exc), style='red')], console.width)
+                    next_refresh = time.monotonic() + args.interval
+                content = Group(*initial.renderables, *error)
+                live.update(viewport.render(content, console.width, console.height, keys.action), refresh=True)
     except KeyboardInterrupt:
         return 0
     except BrokenPipeError:
