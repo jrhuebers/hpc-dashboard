@@ -7,7 +7,9 @@ import math
 import os
 import re
 import select
+import queue as queues
 import subprocess
+import threading
 import termios
 import tty
 import sys
@@ -381,20 +383,83 @@ class QueueCache:
         self.jobs = None
         self.fetched = 0
         self.attempted = -math.inf
+        self.error = None
 
     def fetch(self):
         now = time.monotonic()
-        if self.jobs is None or now - self.attempted >= self.interval:
-            # Retain the last good queue on failure, and retry at the usual cadence.
-            self.attempted = now
-            jobs = self.queue.fetch(self.user)
-            counts = self.queue.fetch_steps(self.user)
-            self.jobs = [replace(job, step_count=counts.get(job.id, 0) if counts is not None else None,
-                                 steps_queried=True) for job in jobs]
-            now = self.fetched = time.monotonic()
+        if now - self.attempted >= self.interval:
+            # Back off from completion, including slow failures and initial errors.
+            try:
+                jobs = self.queue.fetch(self.user)
+                counts = self.queue.fetch_steps(self.user)
+                self.jobs = [replace(job, step_count=counts.get(job.id, 0) if counts is not None else None,
+                                     steps_queried=True) for job in jobs]
+                self.error = None
+                self.fetched = time.monotonic()
+            except Exception as exc:
+                self.error = clean(exc)
+                raise
+            finally:
+                now = self.attempted = time.monotonic()
+        if self.jobs is None:
+            raise RuntimeError(self.error or 'Queue unavailable')
         age = max(0, now - self.fetched)
         return [replace(job, elapsed=job.elapsed + age)
                 if job.state == 'RUNNING' else job for job in self.jobs]
+
+
+class RefreshWorker:
+    """One daemon worker and one result slot; a stalled fetch cannot stall input.
+
+    Only the worker accesses queue/telemetry state. Shutdown never joins blocked
+    scheduler/NFS work, and requests cannot accumulate or spawn replacement workers.
+    """
+    def __init__(self, fetch):
+        self.fetch = fetch
+        self.pending = False
+        self.started = 0
+        self.results = queues.Queue(maxsize=1)
+        self.wake = threading.Event()
+        self.closed = threading.Event()
+        self.thread = threading.Thread(target=self._run, name='sj-refresh', daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.closed.set()
+        self.wake.set()
+
+    def request(self):
+        if self.pending or self.closed.is_set():
+            return False
+        self.pending = True
+        self.started = time.monotonic()
+        self.wake.set()
+        return True
+
+    def take(self):
+        try:
+            result = self.results.get_nowait()
+        except queues.Empty:
+            return None
+        self.pending = False
+        return result
+
+    def _run(self):
+        while True:
+            self.wake.wait()
+            self.wake.clear()
+            if self.closed.is_set():
+                return
+            try:
+                result = (self.fetch(), None)
+            except Exception as exc:
+                result = (None, exc)
+            if self.closed.is_set():
+                return
+            self.results.put_nowait(result)
 
 
 class Viewport:
@@ -440,6 +505,11 @@ class WatchKeys:
                 self.saved = termios.tcgetattr(fd)
                 self.fd = fd
                 tty.setcbreak(fd)
+                attrs = termios.tcgetattr(fd)
+                # Cbreak retains IXON: an accidental Ctrl-S otherwise stops Rich
+                # output (and can block exit cleanup) until Ctrl-Q is pressed.
+                attrs[0] &= ~(termios.IXON | termios.IXOFF)
+                termios.tcsetattr(fd, termios.TCSANOW, attrs)
                 if self.mouse:
                     sys.stdout.write('\x1b[?1000h\x1b[?1006h')
                     sys.stdout.flush()
@@ -448,15 +518,17 @@ class WatchKeys:
         return self
 
     def __exit__(self, *exc):
-        if self.mouse and self.fd is not None:
-            sys.stdout.write('\x1b[?1006l\x1b[?1000l')
-            sys.stdout.flush()
-        if self.fd is not None and self.saved is not None:
-            try:
-                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
-            except (OSError, termios.error):
-                pass
-        self.fd = None
+        try:
+            if self.mouse and self.fd is not None:
+                sys.stdout.write('\x1b[?1006l\x1b[?1000l')
+                sys.stdout.flush()
+        finally:
+            if self.fd is not None and self.saved is not None:
+                try:
+                    termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+                except (OSError, termios.error):
+                    pass
+            self.fd = None
 
     def wait(self, interval):
         self.action = None
@@ -543,29 +615,62 @@ def main():
             except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                 usage = {job.id: 'Telemetry unavailable: ' + clean(exc)
                          for job in jobs if job.user == user and job.state == 'RUNNING'}
+        return jobs, usage, queue.error
+    def display(snapshot):
+        jobs, usage, _ = snapshot
         return render(jobs, user, args.compact, console.width, usage=usage)
     try:
-        initial = frame()
         if not args.watch:
-            console.print(initial)
+            console.print(display(frame()))
             return 0
-        # Alternate screen restores the previous terminal contents on exit.
+        # Enter the terminal before the first fetch; even startup is cancellable.
+        initial = Group(Text('Loading queue…', style=GREY))
         viewport = Viewport()
-        with WatchKeys(mouse=True) as keys, Live(viewport.render(initial, console.width, console.height), console=console, screen=True, auto_refresh=False, vertical_overflow='crop') as live:
-            next_refresh = time.monotonic() + args.interval
-            error = []
+        with WatchKeys(mouse=True) as keys, Live(viewport.render(initial, console.width, console.height), console=console, screen=True, auto_refresh=False, vertical_overflow='crop') as live, RefreshWorker(frame) as worker:
+            next_refresh = time.monotonic()
+            last_good = None
+            last_paint = -math.inf
+            dimensions = (console.width, console.height)
+            snapshot = None
+            error = None
             while True:
-                if keys.wait(max(0, next_refresh - time.monotonic())):
+                now = time.monotonic()
+                result = worker.take()
+                if result is not None:
+                    content, exc = result
+                    if exc is None:
+                        snapshot, error, last_good = content, content[2], now
+                    else:
+                        error = clean(exc) or type(exc).__name__
+                    next_refresh = now + args.interval
+                if now >= next_refresh:
+                    worker.request()
+                size = (console.width, console.height)
+                if result is not None or keys.action or size != dimensions or now - last_paint >= 1:
+                    # Reflow cached data on the UI thread at the current width,
+                    # including resize/scroll actions while acquisition is stalled.
+                    if snapshot is not None:
+                        initial = display(snapshot)
+                    view = viewport.render(initial, *size, keys.action)
+                    status = []
+                    if worker.pending and now - worker.started >= 1:
+                        status.append(f'Refreshing {now - worker.started:.0f}s')
+                    if status or error:
+                        if last_good is not None:
+                            status.append(f'last display {now - last_good:.0f}s ago')
+                        label = 'Refresh failed' if error else status.pop(0)
+                        if error:
+                            status.append(' '.join(error.splitlines()))
+                        line_range = view.renderables[-1].plain.split(' · ', 1)[0]
+                        footer = Text(label + ' · q quit · ' + line_range + ' · ' + ' · '.join(status), style='red' if error else GREY)
+                        footer.truncate(max(1, size[0]), overflow='ellipsis')
+                        view = Group(*view.renderables[:-1], footer)
+                    live.update(view, refresh=True)
+                    last_paint, dimensions = now, size
+                # Poll completed work without busy-spinning or adding key latency.
+                delay = 0.1 if worker.pending else min(0.1, max(0, next_refresh - time.monotonic()))
+                if keys.wait(delay):
                     return 0
-                if time.monotonic() >= next_refresh:
-                    try:
-                        initial = frame()
-                        error = []
-                    except (RuntimeError, ValueError, TypeError, KeyError) as exc:
-                        error = wrap_lines([Text('Refresh failed: ' + clean(exc), style='red')], console.width)
-                    next_refresh = time.monotonic() + args.interval
-                content = Group(*initial.renderables, *error)
-                live.update(viewport.render(content, console.width, console.height, keys.action), refresh=True)
     except KeyboardInterrupt:
         return 0
     except BrokenPipeError:

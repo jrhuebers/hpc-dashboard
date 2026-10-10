@@ -3,6 +3,7 @@ import io
 import json
 import math
 import subprocess
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -308,6 +309,34 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(cache.fetch()[0].elapsed, 111)
         self.assertEqual(queue.fetch.call_count, 2)
 
+    @patch('slurmjobs.time.monotonic')
+    def test_slow_failure_backoff_from_completion_including_startup(self, clock):
+        clock.return_value = 100
+        queue = Mock()
+        def fail(user):
+            clock.return_value += 10
+            raise RuntimeError('offline')
+        queue.fetch.side_effect = fail
+        cache = s.QueueCache(queue)
+        with self.assertRaisesRegex(RuntimeError, 'offline'):
+            cache.fetch()
+        self.assertEqual(cache.attempted, 110)
+        clock.return_value = 119
+        with self.assertRaisesRegex(RuntimeError, 'offline'):
+            cache.fetch()
+        self.assertEqual(queue.fetch.call_count, 1)
+        clock.return_value = 120
+        with self.assertRaisesRegex(RuntimeError, 'offline'):
+            cache.fetch()
+        self.assertEqual(queue.fetch.call_count, 2)
+        self.assertEqual(cache.attempted, 130)
+        clock.return_value = 140
+        queue.fetch.side_effect = None
+        queue.fetch.return_value = []
+        queue.fetch_steps.return_value = {}
+        self.assertEqual(cache.fetch(), [])
+        self.assertIsNone(cache.error)
+
     @patch('slurmjobs.time.monotonic', return_value=100)
     def test_pending_elapsed_not_extrapolated(self, clock):
         queue = Mock()
@@ -317,6 +346,51 @@ class CacheTests(unittest.TestCase):
         cache.fetch()
         clock.return_value = 105
         self.assertEqual(cache.fetch()[0].elapsed, 0)
+
+
+class RefreshWorkerTests(unittest.TestCase):
+    def test_one_inflight_request_and_nonblocking_shutdown(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def fetch():
+            calls.append(1)
+            entered.set()
+            release.wait(2)
+            return 'frame'
+        worker = s.RefreshWorker(fetch)
+        try:
+            with worker:
+                self.assertTrue(worker.request())
+                self.assertTrue(entered.wait(1))
+                for _ in range(100):
+                    self.assertFalse(worker.request())
+                    self.assertIsNone(worker.take())
+                self.assertEqual(calls, [1])
+                self.assertTrue(worker.thread.daemon)
+            self.assertTrue(worker.closed.is_set())
+            self.assertFalse(worker.request())
+            self.assertTrue(worker.thread.is_alive())  # Exit did not join stuck I/O.
+        finally:
+            release.set()
+            worker.thread.join(1)
+        self.assertFalse(worker.thread.is_alive())
+        self.assertIsNone(worker.take())
+
+    def test_results_errors_and_reuse_same_thread(self):
+        calls = Mock(side_effect=['first', RuntimeError('offline'), 'recovered'])
+        with s.RefreshWorker(calls) as worker:
+            thread = worker.thread
+            for expected in ('first', 'offline', 'recovered'):
+                self.assertTrue(worker.request())
+                # Wait on the mailbox condition, not an arbitrary sleep.
+                with worker.results.not_empty:
+                    self.assertTrue(worker.results.not_empty.wait_for(lambda: worker.results._qsize() > 0, timeout=1))
+                self.assertFalse(worker.request())  # Unconsumed result also bounds work.
+                content, error = worker.take()
+                self.assertEqual(content if error is None else str(error), expected)
+                self.assertFalse(worker.pending)
+                self.assertIs(worker.thread, thread)
+        worker.thread.join(1)
 
 
 class WatchKeyTests(unittest.TestCase):
@@ -348,7 +422,7 @@ class WatchKeyTests(unittest.TestCase):
 
     @patch('slurmjobs.tty.setcbreak')
     @patch('slurmjobs.termios.tcsetattr')
-    @patch('slurmjobs.termios.tcgetattr', return_value=['saved'])
+    @patch('slurmjobs.termios.tcgetattr', side_effect=[[s.termios.IXON | s.termios.IXOFF, 0, 0, 0, 0, 0, []], [s.termios.IXON | s.termios.IXOFF, 0, 0, 0, 0, 0, []]])
     @patch('slurmjobs.os.isatty', return_value=True)
     @patch('slurmjobs.sys.stdin')
     def test_terminal_restored_on_exception(self, stdin, isatty, get, restore, cbreak):
@@ -357,7 +431,23 @@ class WatchKeyTests(unittest.TestCase):
             with s.WatchKeys():
                 cbreak.assert_called_once_with(3)
                 raise RuntimeError('test')
-        restore.assert_called_once_with(3, s.termios.TCSADRAIN, ['saved'])
+        self.assertEqual(restore.call_count, 2)
+        self.assertEqual(restore.call_args_list[0].args, (3, s.termios.TCSANOW, [0, 0, 0, 0, 0, 0, []]))
+        restore.assert_called_with(3, s.termios.TCSADRAIN, [s.termios.IXON | s.termios.IXOFF, 0, 0, 0, 0, 0, []])
+
+
+    def test_restoration_survives_mouse_output_failure(self):
+        for operation in ('write', 'flush'):
+            with self.subTest(operation=operation), \
+                 patch.object(s.sys, 'stdout') as output, \
+                 patch.object(s.termios, 'tcsetattr') as restore:
+                getattr(output, operation).side_effect = BrokenPipeError()
+                keys = s.WatchKeys(mouse=True)
+                keys.fd, keys.saved = 3, ['saved']
+                with self.assertRaises(BrokenPipeError):
+                    keys.__exit__(None, None, None)
+                restore.assert_called_once_with(3, s.termios.TCSADRAIN, ['saved'])
+                self.assertIsNone(keys.fd)
 
 
 class RenderingTests(unittest.TestCase):
@@ -510,14 +600,19 @@ class RenderingTests(unittest.TestCase):
                      patch.object(s, 'QueueCache') as queue, \
                      patch('telemetry.Telemetry') as telemetry, \
                      patch.object(s, 'Live') as live, \
+                     patch.object(s, 'RefreshWorker') as worker, \
                      patch.object(s, 'WatchKeys') as keys, \
                      patch.object(s.sys, 'argv', ['sj'] + flags):
                     console.return_value.is_terminal = terminal
                     console.return_value.width = 80
                     console.return_value.height = 24
                     queue.return_value.fetch.return_value = []
+                    queue.return_value.error = None
                     telemetry.return_value.fetch.return_value = {}
                     keys.return_value.__enter__.return_value.wait.return_value = True
+                    refresh = worker.return_value.__enter__.return_value
+                    refresh.take.return_value = None
+                    refresh.pending = False
                     self.assertEqual(s.main(), 0)
                     self.assertEqual(telemetry.called, usage)
                     self.assertEqual(live.called, watching)

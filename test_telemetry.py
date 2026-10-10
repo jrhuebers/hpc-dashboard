@@ -17,6 +17,21 @@ def job(**values):
     return SimpleNamespace(**defaults)
 
 
+class Clock:
+    """Wall time can jump independently of the scheduling clock."""
+    def __init__(self, wall=100, monotonic=0):
+        self.wall = wall
+        self.monotonic = monotonic
+
+    def advance(self, seconds):
+        self.wall += seconds
+        self.monotonic += seconds
+
+    def patches(self):
+        return (patch.object(t.time, 'time', side_effect=lambda: self.wall),
+                patch.object(t.time, 'monotonic', side_effect=lambda: self.monotonic))
+
+
 class TelemetryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -25,6 +40,13 @@ class TelemetryTests(unittest.TestCase):
         self.cache.start()
         self.addCleanup(self.cache.stop)
         self.addCleanup(self.temp.cleanup)
+        # Legacy sample tests mostly mock wall time; keep scheduler time offline
+        # and deterministic too. Elapsed-query tests override with Clock below.
+        monotonic = patch.object(t.time, 'monotonic', return_value=100)
+        monotonic.start()
+        self.addCleanup(monotonic.stop)
+        t._CLEANUP_AT.clear()
+        t._CLEANUP_CURSOR.clear()
 
     def directory(self):
         path = self.root / '123'
@@ -88,7 +110,7 @@ class TelemetryTests(unittest.TestCase):
     @patch.object(t, 'cleanup')
     def test_empty_queue_still_runs_expiry_cleanup(self, cleanup):
         self.assertEqual({}, t.Telemetry('me').fetch([]))
-        cleanup.assert_called_once_with(self.root)
+        cleanup.assert_called_once_with(self.root, timeout=10)
 
     @patch.object(t, 'atomic_json')
     @patch.object(t, 'gpu_sample', return_value=[])
@@ -176,7 +198,8 @@ class TelemetryTests(unittest.TestCase):
         t.atomic_json(self.directory() / f'sample-{node}.json', sample)
 
     def fetch_at(self, telemetry, timestamp, allocation=None):
-        with patch.object(t.time, 'time', return_value=timestamp):
+        with patch.object(t.time, 'time', return_value=timestamp), \
+                patch.object(t.time, 'monotonic', return_value=timestamp):
             return telemetry.fetch([allocation or job(nodes='node01')])['123']
 
     @patch.object(t.Telemetry, '_launch')
@@ -291,7 +314,7 @@ class TelemetryTests(unittest.TestCase):
         self.assertIn('GPU unavailable', status)
         telemetry.fetch([])
         for cache in (telemetry.previous, telemetry.accounting, telemetry.metrics,
-                      telemetry.fallback, telemetry.profiles):
+                      telemetry.fallback, telemetry.profiles, telemetry.live_retries):
             self.assertEqual({}, cache)
 
     def test_gpu_exact_allocation_ids_and_uuid(self):
@@ -536,6 +559,296 @@ class TelemetryTests(unittest.TestCase):
         self.assertNotIn('--gres=none', command)
         proc.terminate.assert_not_called()
         sleep.assert_not_called()
+
+
+    def expired_directory(self, jobid='123'):
+        path = self.root / jobid
+        path.mkdir(exist_ok=True)
+        t.atomic_json(path / 'meta.json', {'starts': t.MAX_STARTS, 'ended_at': 1})
+        return path
+
+    def test_completion_queries_propagate_timeout_including_fallback(self):
+        for timeout in (10, 0.25):
+            with self.subTest(timeout=timeout), \
+                    patch.object(t, 'run', side_effect=[None, '124\n']) as run:
+                ended = t.job_ended('123') if timeout == 10 else t.job_ended('123', timeout)
+                self.assertTrue(ended)
+                self.assertEqual([timeout, timeout], [c.args[1] for c in run.call_args_list])
+        with patch.object(t, 'run', return_value='RUNNING') as run:
+            self.assertFalse(t.job_ended('123', timeout=0.5))
+            self.assertEqual(0.5, run.call_args.args[1])
+
+    def test_dashboard_timeout_reaches_real_cleanup_on_empty_queue(self):
+        path = self.expired_directory()
+        with patch.object(t.time, 'time', return_value=2 * t.TTL), \
+                patch.object(t, 'run', side_effect=[None, '']) as run, \
+                patch.object(t.subprocess, 'Popen') as popen:
+            self.assertEqual({}, t.Telemetry('me', timeout=0.2).fetch([]))
+        self.assertEqual([0.2, 0.2], [c.args[1] for c in run.call_args_list])
+        self.assertFalse((path / 'meta.json').exists())
+        self.assertEqual({'launch.lock', 'run.lock'}, {p.name for p in path.iterdir()})
+        popen.assert_not_called()
+
+    def test_cleanup_cadence_starts_after_slow_completion_check(self):
+        self.expired_directory()
+        clock = Clock(wall=2 * t.TTL)
+        def slow_check(*args, **kwargs):
+            clock.advance(15)
+            return False
+        wall, monotonic = clock.patches()
+        with wall, monotonic, patch.object(t, 'job_ended', side_effect=slow_check) as ended:
+            t.cleanup(self.root, timeout=0.2)
+            self.assertEqual(15, t._CLEANUP_AT[str(self.root)])
+            clock.wall += 10000  # Wall jumps cannot shorten the cooldown.
+            t.cleanup(self.root)
+            clock.advance(t.ACCOUNTING_INTERVAL - 0.1)
+            t.cleanup(self.root)
+            ended.assert_called_once_with('123', timeout=0.2)
+            clock.wall -= 5000  # Still expired after a backward clock jump.
+            clock.advance(0.1)
+            t.cleanup(self.root)
+            self.assertEqual(2, ended.call_count)
+            self.assertEqual(40, t._CLEANUP_AT[str(self.root)])
+
+    def test_cleanup_directory_error_still_sets_completion_cooldown(self):
+        clock = Clock(wall=2 * t.TTL)
+        def slow_error(path):
+            clock.advance(15)
+            raise OSError('NFS error')
+        wall, monotonic = clock.patches()
+        with wall, monotonic, patch.object(Path, 'iterdir', slow_error):
+            with self.assertRaises(OSError):
+                t.cleanup(self.root)
+            self.assertEqual(15, t._CLEANUP_AT[str(self.root)])
+            t.cleanup(self.root)  # No immediate repeat of an expensive failure.
+            self.assertEqual(15, clock.monotonic)
+
+    def test_cleanup_budget_rotates_past_live_and_failed_old_jobs(self):
+        ids = ['100', '101', '102', '103', '104', '105']
+        paths = {i: self.expired_directory(i) for i in ids}
+        tombstone = self.root / '099'
+        tombstone.mkdir()
+        (tombstone / 'run.lock').touch()
+        self.root.joinpath('098').symlink_to(paths['105'], target_is_directory=True)
+        self.root.joinpath('bad-name').mkdir()
+        fresh = self.root / '097'
+        fresh.mkdir()
+        (fresh / 'seen').touch()
+        now = t.time.time()  # Fresh data and lock-only dirs must not consume checks.
+        checked = []
+        def ended(jobid, timeout):
+            self.assertEqual(0.2, timeout)
+            checked.append(jobid)
+            return jobid not in ('100', '101')  # Old live/error dirs persist forever.
+        with patch.object(t, 'job_ended', side_effect=ended):
+            for _ in range(4):
+                count = len(checked)
+                t.cleanup(self.root, now=now, timeout=0.2)
+                self.assertLessEqual(len(checked) - count, t.CLEANUP_CHECK_BUDGET)
+        self.assertEqual(ids + ['100', '101'], checked)
+        for i in ids:
+            self.assertEqual(i in ('100', '101'), (paths[i] / 'meta.json').exists())
+        self.assertTrue((fresh / 'seen').exists())
+        self.assertTrue(self.root.joinpath('098').is_symlink())
+
+    def test_cleanup_budget_bounds_fallback_scheduler_calls_on_failure(self):
+        for i in range(10):
+            self.expired_directory(str(100 + i))
+        with patch.object(t, 'run', return_value=None) as run:
+            t.cleanup(self.root, now=2 * t.TTL, timeout=0.1)
+        self.assertEqual(2 * t.CLEANUP_CHECK_BUDGET, run.call_count)
+        self.assertTrue(all(c.args[1] == 0.1 for c in run.call_args_list))
+        self.assertTrue(all((p / 'meta.json').exists() for p in self.root.iterdir()))
+
+    def test_cleanup_held_locks_preserve_data_and_both_lock_inodes(self):
+        path = self.expired_directory()
+        for name in ('launch.lock', 'run.lock'):
+            (path / name).touch()
+        inodes = {name: (path / name).stat().st_ino for name in ('launch.lock', 'run.lock')}
+        with patch.object(t, 'job_ended', return_value=True):
+            for name in inodes:
+                with t.lock(path / name) as acquired:
+                    self.assertTrue(acquired)
+                    t.cleanup(self.root, now=2 * t.TTL)
+                    self.assertEqual(t.MAX_STARTS, t.read_meta(path / 'meta.json')['starts'])
+            t.cleanup(self.root, now=2 * t.TTL)
+        self.assertEqual(set(inodes), {p.name for p in path.iterdir()})
+        self.assertEqual(inodes, {name: (path / name).stat().st_ino for name in inodes})
+
+    @patch.object(t.subprocess, 'Popen')
+    def test_failed_liveness_backoff_is_completion_based_capped_and_does_not_spend_starts(self, popen):
+        path = self.directory()
+        t.atomic_json(path / 'meta.json', {'starts': 1, 'heartbeat': 0})
+        telemetry = t.Telemetry('me', timeout=0.2)
+        clock = Clock()
+        def failed_probe(jobid, timeout):
+            self.assertEqual(0.2, timeout)
+            clock.advance(15)
+            return None
+        wall, monotonic = clock.patches()
+        with wall, monotonic, patch.object(t, 'live_step', side_effect=failed_probe) as live:
+            for delay in (10, 20, 40, 60, 60):
+                telemetry._launch(job(), path)
+                self.assertEqual((clock.monotonic + delay, delay), telemetry.live_retries['123'])
+                calls = live.call_count
+                clock.wall += 10000
+                clock.advance(delay - 0.1)
+                telemetry._launch(job(), path)
+                self.assertEqual(calls, live.call_count)
+                clock.advance(0.1)
+            self.assertEqual(5, live.call_count)
+            self.assertEqual(1, t.read_meta(path / 'meta.json')['starts'])
+            popen.assert_not_called()
+            live.side_effect = None
+            live.return_value = False
+            telemetry._launch(job(), path)
+            self.assertNotIn('123', telemetry.live_retries)
+            self.assertEqual(t.MAX_STARTS, t.read_meta(path / 'meta.json')['starts'])
+            popen.assert_called_once()
+            # Successful launch still obeys the original lifetime restart budget.
+            meta = t.read_meta(path / 'meta.json')
+            meta['heartbeat'] = 0
+            t.atomic_json(path / 'meta.json', meta)
+            telemetry._launch(job(), path)
+            popen.assert_called_once()
+
+    @patch.object(t.subprocess, 'Popen')
+    def test_confirmed_live_probe_has_fixed_completion_cooldown_and_resets_failure_penalty(self, popen):
+        path = self.directory()
+        t.atomic_json(path / 'meta.json', {'starts': 1, 'heartbeat': 0})
+        telemetry = t.Telemetry('me', timeout=0.2)
+        telemetry.live_retries['123'] = (0, t.LIVE_RETRY_MAX)
+        clock = Clock()
+        def slow_live(jobid, timeout):
+            self.assertEqual(0.2, timeout)
+            clock.advance(15)
+            return True
+        wall, monotonic = clock.patches()
+        with wall, monotonic, patch.object(t, 'live_step', side_effect=slow_live) as live:
+            for expected_calls in (1, 2):
+                telemetry._launch(job(), path)
+                self.assertEqual(expected_calls, live.call_count)
+                self.assertEqual((clock.monotonic + t.LIVE_RETRY_INTERVAL, 0),
+                                 telemetry.live_retries['123'])
+                clock.wall += 10000
+                telemetry._launch(job(), path)
+                clock.advance(t.LIVE_RETRY_INTERVAL - 0.1)
+                telemetry._launch(job(), path)
+                self.assertEqual(expected_calls, live.call_count)
+                clock.advance(0.1)
+            # Successful live checks don't compound earlier failures or each other.
+            live.side_effect = None
+            live.return_value = None
+            telemetry._launch(job(), path)
+            self.assertEqual(3, live.call_count)
+            self.assertEqual((clock.monotonic + t.LIVE_RETRY_INTERVAL, t.LIVE_RETRY_INTERVAL),
+                             telemetry.live_retries['123'])
+        self.assertEqual(1, t.read_meta(path / 'meta.json')['starts'])
+        self.assertEqual(0, t.read_meta(path / 'meta.json')['heartbeat'])
+        popen.assert_not_called()
+
+    @patch.object(t.subprocess, 'Popen')
+    @patch.object(t, 'live_step', return_value=None)
+    def test_liveness_backoff_is_per_instance_and_per_job(self, live, popen):
+        first = t.Telemetry('me')
+        second = t.Telemetry('me')
+        path = self.directory()
+        other = self.root / '124'
+        other.mkdir()
+        first._launch(job(), path)
+        first._launch(job(), path)
+        first._launch(job(id='124'), other)
+        second._launch(job(), path)
+        self.assertEqual(3, live.call_count)
+        self.assertEqual({'123', '124'}, set(first.live_retries))
+        self.assertEqual({'123'}, set(second.live_retries))
+        popen.assert_not_called()
+
+    @patch.object(t, 'cleanup')
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t.Telemetry, '_accounting', return_value={})
+    def test_liveness_retry_state_is_pruned_with_inactive_jobs(self, accounting, launch, cleanup):
+        telemetry = t.Telemetry('me')
+        telemetry.live_retries = {'123': (1000, 60), '124': (1000, 60)}
+        telemetry.fetch([job()])
+        self.assertEqual({'123'}, set(telemetry.live_retries))
+        telemetry.fetch([])
+        self.assertEqual({}, telemetry.live_retries)
+
+    @patch.object(t.subprocess, 'Popen')
+    def test_launch_metadata_uses_time_after_slow_probe(self, popen):
+        clock = Clock()
+        def slow_probe(*args):
+            clock.advance(15)
+            return False
+        wall, monotonic = clock.patches()
+        with wall, monotonic, patch.object(t, 'live_step', side_effect=slow_probe):
+            t.Telemetry('me')._launch(job(), self.directory())
+        meta = t.read_meta(self.directory() / 'meta.json')
+        self.assertEqual(115, meta['heartbeat'])
+        self.assertEqual(115, meta['last_seen'])
+        self.assertEqual(1, meta['starts'])
+        popen.assert_called_once()
+
+    @patch.object(t, 'cleanup')
+    @patch.object(t.Telemetry, '_launch')
+    def test_accounting_elapsed_queries_use_completion_timestamps_and_cooldown(self, launch, cleanup):
+        telemetry = t.Telemetry('me', timeout=0.2)
+        clock = Clock()
+        outputs = iter(['123.batch|1|00:10|1G', '123.batch|1|00:60|2G', None, ''])
+        def slow_run(args, timeout):
+            self.assertEqual(0.2, timeout)
+            clock.advance(15)
+            return next(outputs)
+        wall, monotonic = clock.patches()
+        with wall, monotonic, patch.object(t, 'run', side_effect=slow_run) as run:
+            status = telemetry.fetch([job()])['123']
+            self.assertEqual(115, telemetry.accounting_at)
+            self.assertEqual(15, telemetry.accounting_checked_at)
+            self.assertIn('RSS 1.0 GiB', status)
+            self.assertNotIn('stale', status)
+            # Slow queries must not cause another query on the next frame.
+            telemetry.fetch([job()])
+            clock.advance(9)
+            telemetry.fetch([job()])
+            run.assert_called_once()
+            clock.advance(1)
+            status = telemetry.fetch([job()])['123']
+            self.assertEqual(140, telemetry.accounting_at)
+            self.assertEqual(40, telemetry.accounting_checked_at)
+            self.assertIn('CPU 2.0/8 cores', status)  # 50 CPU seconds / 25 elapsed.
+            self.assertIn('RSS 2.0 GiB', status)
+            self.assertNotIn('stale', status)
+            clock.advance(10)
+            status = telemetry.fetch([job()])['123']
+            self.assertEqual(140, telemetry.accounting_at)  # Failed reads retain age.
+            self.assertEqual(65, telemetry.accounting_checked_at)
+            self.assertIn('RSS 2.0 GiB (stale, 25s old)', status)
+            telemetry.fetch([job()])
+            self.assertEqual(3, run.call_count)
+            clock.advance(10)
+            status = telemetry.fetch([job()])['123']
+            self.assertEqual(190, telemetry.accounting_at)
+            self.assertEqual(90, telemetry.accounting_checked_at)
+            self.assertIn('RSS 2.0 GiB (stale, 50s old)', status)
+            self.assertEqual(4, run.call_count)
+
+    @patch.object(t, 'cleanup')
+    @patch.object(t.Telemetry, '_launch')
+    @patch.object(t, 'run', return_value=None)
+    def test_accounting_cooldown_ignores_wall_clock_jumps(self, run, launch, cleanup):
+        clock = Clock()
+        telemetry = t.Telemetry('me')
+        wall, monotonic = clock.patches()
+        with wall, monotonic:
+            telemetry.fetch([job()])  # First query is immediate even at monotonic 0.
+            clock.wall += 10000
+            telemetry.fetch([job()])
+            run.assert_called_once()
+            clock.wall -= 20000
+            clock.advance(10)
+            telemetry.fetch([job()])
+            self.assertEqual(2, run.call_count)
 
 
 if __name__ == '__main__':

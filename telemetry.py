@@ -30,7 +30,12 @@ CLOCK_SKEW = 1  # Small clock offsets between compute and dashboard hosts.
 TTL = 3600
 MAX_STARTS = 2
 ACCOUNTING_INTERVAL = 10
+LIVE_RETRY_INTERVAL = 10
+LIVE_RETRY_MAX = 60
+# Each completion check makes at most two scheduler calls (including fallback).
+CLEANUP_CHECK_BUDGET = 2
 _CLEANUP_AT = {}
+_CLEANUP_CURSOR = {}
 JOB_ID = re.compile(r'\d+(?:_\d+)?(?:\+\d+)?\Z')
 
 
@@ -129,14 +134,14 @@ def live_step(jobid, timeout=10):
     return None if output is None else NAME in output.splitlines()
 
 
-def job_ended(jobid):
-    states = run(['squeue', '--jobs', jobid, '--states=all', '--noheader', '--format=%T'])
+def job_ended(jobid, timeout=10):
+    states = run(['squeue', '--jobs', jobid, '--states=all', '--noheader', '--format=%T'], timeout)
     if states is not None:
         return not states.strip()
     # Some releases return an error for an ID that has left the queue. A
     # successful owner-wide listing distinguishes this from scheduler failure.
     ids = run(['squeue', '--user', pwd.getpwuid(os.getuid()).pw_name,
-               '--array', '--states=all', '--noheader', '--format=%i'])
+               '--array', '--states=all', '--noheader', '--format=%i'], timeout)
     return ids is not None and jobid not in {line.strip() for line in ids.splitlines()}
 
 
@@ -200,11 +205,12 @@ class Telemetry:
         self.previous = {}
         self.accounting = {}
         self.accounting_at = 0
-        self.accounting_checked_at = 0
+        self.accounting_checked_at = None  # Monotonic completion time, not wall time.
         self.accounting_confirmed = False
         self.metrics = {}
         self.fallback = {}
         self.profiles = {}
+        self.live_retries = {}  # job ID -> (next monotonic probe time, failure delay)
 
     def _launch(self, job, directory):
         with lock(directory / 'launch.lock') as acquired:
@@ -220,9 +226,22 @@ class Telemetry:
                     return
                 if meta.get('starts', 0) >= MAX_STARTS:
                     return
-                # Fail closed: scheduler errors must never create duplicate steps.
-                if live_step(job.id, self.timeout) is not False:
+                retry_at, delay = self.live_retries.get(job.id, (0, 0))
+                if time.monotonic() < retry_at:
                     return
+                # Fail closed: scheduler errors must never create duplicate steps.
+                live = live_step(job.id, self.timeout)
+                if live is None:
+                    delay = min(LIVE_RETRY_MAX, max(LIVE_RETRY_INTERVAL, delay * 2))
+                    self.live_retries[job.id] = (time.monotonic() + delay, delay)
+                    return
+                self.live_retries.pop(job.id, None)
+                if live is not False:
+                    # A surviving collector with a stale heartbeat needs no
+                    # per-frame probe. Success resets the failure penalty.
+                    self.live_retries[job.id] = (time.monotonic() + LIVE_RETRY_INTERVAL, 0)
+                    return
+                now = time.time()  # The scheduler probe may have been slow.
                 meta.update(starts=meta.get('starts', 0) + 1,
                             heartbeat=now, last_seen=now, ended_at=0)
                 atomic_json(directory / 'meta.json', meta)
@@ -265,7 +284,8 @@ class Telemetry:
         jobs = [j for j in jobs if j.user == self.user and j.state == 'RUNNING'
                 and JOB_ID.fullmatch(j.id)]
         active = {j.id for j in jobs}
-        caches = (self.previous, self.accounting, self.metrics, self.fallback, self.profiles)
+        caches = (self.previous, self.accounting, self.metrics, self.fallback,
+                  self.profiles, self.live_retries)
         for cache in caches:
             for key in list(cache):
                 if key not in active:
@@ -276,22 +296,22 @@ class Telemetry:
                 for cache in caches:
                     cache.pop(job.id, None)
             self.profiles[job.id] = profile
-        now = time.time()
         root = None
         try:
             root = cache_root()
-            cleanup(root)
+            cleanup(root, timeout=self.timeout)
         except OSError:
             pass
         if not jobs:
             return {}
-        if now - self.accounting_checked_at >= ACCOUNTING_INTERVAL:
+        if (self.accounting_checked_at is None or
+                time.monotonic() - self.accounting_checked_at >= ACCOUNTING_INTERVAL):
             accounting = self._accounting(jobs)
-            self.accounting_checked_at = now
+            self.accounting_checked_at = time.monotonic()
             self.accounting_confirmed = accounting is not None
             if accounting is not None:
                 self.accounting = accounting
-                self.accounting_at = now
+                self.accounting_at = time.time()
         result = {}
         for job in jobs:
             nodes = node_names(job.nodes)
@@ -408,40 +428,58 @@ class Telemetry:
         return result
 
 
-def cleanup(root, now=None):
-    """Remove old files, not lock inodes/directories (avoids lock unlink races)."""
+def cleanup(root, now=None, timeout=10):
+    """Bound completion probes; retain lock tombstones and rotate across passes.
+
+    Explicit ``now`` forces a pass (useful for expiry tests). Scheduling always
+    uses monotonic completion time, independent of filesystem wall timestamps.
+    """
+    key = str(root)
     if now is None:
-        now = time.time()
-        if now - _CLEANUP_AT.get(str(root), 0) < ACCOUNTING_INTERVAL:
+        completed = _CLEANUP_AT.get(key)
+        if completed is not None and time.monotonic() - completed < ACCOUNTING_INTERVAL:
             return
-        _CLEANUP_AT[str(root)] = now
-    for directory in root.iterdir():
-        if not directory.is_dir() or directory.is_symlink() or not JOB_ID.fullmatch(directory.name):
-            continue
-        try:
-            files = [p for p in directory.iterdir() if p.name not in ('launch.lock', 'run.lock')]
-            if not files:
-                continue
-            meta = read_meta(directory / 'meta.json')
-            # Cached queue frames may touch 'seen' briefly after job completion.
-            # A confirmed end timestamp prevents those readers extending expiry.
-            latest = meta.get('ended_at', 0) or max(
-                [directory.stat().st_mtime] + [p.stat().st_mtime for p in files])
-            if now - latest < TTL:
-                continue
-            # Do not reset a failed collector's start budget in a live allocation.
-            if not job_ended(directory.name):
-                continue
-            with lock(directory / 'launch.lock') as acquired:
-                if not acquired:
+        now = time.time()
+    checks = 0
+    try:
+        directories = sorted(root.iterdir(), key=lambda p: p.name)
+        cursor = _CLEANUP_CURSOR.get(key, '')
+        directories = ([p for p in directories if p.name > cursor] +
+                       [p for p in directories if p.name <= cursor])
+        for directory in directories:
+            if checks >= CLEANUP_CHECK_BUDGET:
+                break
+            try:
+                if (not JOB_ID.fullmatch(directory.name) or directory.is_symlink() or
+                        not directory.is_dir()):
                     continue
-                with lock(directory / 'run.lock') as idle:
-                    if idle:
-                        for p in directory.iterdir():
-                            if p.name not in ('launch.lock', 'run.lock') and p.is_file():
-                                p.unlink()
-        except OSError:
-            continue
+                files = [p for p in directory.iterdir() if p.name not in ('launch.lock', 'run.lock')]
+                if not files:
+                    continue
+                meta = read_meta(directory / 'meta.json')
+                # Cached queue frames may touch 'seen' briefly after job completion.
+                # A confirmed end timestamp prevents those readers extending expiry.
+                latest = meta.get('ended_at', 0) or max(
+                    [directory.stat().st_mtime] + [p.stat().st_mtime for p in files])
+                if now - latest < TTL:
+                    continue
+                checks += 1
+                _CLEANUP_CURSOR[key] = directory.name
+                # Do not reset a failed collector's start budget in a live allocation.
+                if not job_ended(directory.name, timeout=timeout):
+                    continue
+                with lock(directory / 'launch.lock') as acquired:
+                    if not acquired:
+                        continue
+                    with lock(directory / 'run.lock') as idle:
+                        if idle:
+                            for p in directory.iterdir():
+                                if p.name not in ('launch.lock', 'run.lock') and p.is_file():
+                                    p.unlink()
+            except OSError:
+                continue
+    finally:
+        _CLEANUP_AT[key] = time.monotonic()
 
 
 def launch_env():
