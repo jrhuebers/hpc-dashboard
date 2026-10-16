@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rich.console import Console
-import slurmjobs as s
+import hpc_dashboard as s
 
 
 def wrapped(value, **flags):
@@ -159,7 +159,7 @@ class LegacyTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_timeout_and_missing_command(self, run):
         queue = s.Queue(timeout=2)
         run.side_effect = subprocess.TimeoutExpired('squeue', 2)
@@ -170,15 +170,15 @@ class QueueTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'not installed'):
             queue.fetch()
 
-    @patch('slurmjobs.time.time', return_value=1000)
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.time.time', return_value=1000)
+    @patch('hpc_dashboard.subprocess.run')
     def test_json_fetch(self, run, clock):
         run.return_value = subprocess.CompletedProcess([], 0, json.dumps({'jobs': [raw_job()]}), '')
         jobs = s.Queue().fetch('me')
         self.assertEqual(jobs[0].elapsed, 100)
         self.assertEqual(run.call_args.args[0], ['squeue', '--json', '--user', 'me'])
 
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_unsupported_json_fallback_is_remembered(self, run):
         for error in ('unrecognized option --json', 'unknown option json', 'invalid option json', 'json not supported'):
             with self.subTest(error=error):
@@ -195,7 +195,7 @@ class QueueTests(unittest.TestCase):
                                  ['squeue', '--noheader', '--noconvert', '--format', s.SEPARATOR.join(s.FIELDS), '--user', 'me'])
                 self.assertNotIn('--json', run.call_args.args[0])
 
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_real_failures_do_not_trigger_fallback(self, run):
         run.return_value = subprocess.CompletedProcess([], 1, '', 'controller unavailable')
         queue = s.Queue()
@@ -204,7 +204,7 @@ class QueueTests(unittest.TestCase):
         self.assertFalse(queue.legacy)
         self.assertEqual(run.call_count, 1)
 
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_json_errors_and_invalid_payload(self, run):
         run.return_value = subprocess.CompletedProcess([], 0, '{"errors":["failure"]}', '')
         with self.assertRaisesRegex(RuntimeError, 'Slurm returned errors'):
@@ -217,7 +217,7 @@ class QueueTests(unittest.TestCase):
 
 
 class StepTests(unittest.TestCase):
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_batched_step_counts_include_reserved_and_named_steps(self, run):
         payload = {'steps': [dict(id=step, state=['RUNNING'])
                             for step in ('42.batch', '42.extern', '42.1', '42.1', '44+1.batch')]}
@@ -226,7 +226,7 @@ class StepTests(unittest.TestCase):
         self.assertEqual(s.Queue().fetch_steps('me'), {'42': 3, '43_7': 1, '44+1': 1})
         self.assertEqual(run.call_args.args[0], ['squeue', '--steps', '--json', '--user', 'me'])
 
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_failed_or_malformed_step_query_is_unknown(self, run):
         payloads = ('malformed', '{}', '{"steps": [{}]}', '{"steps": [], "errors": ["failure"]}',
                     '{"steps": [{"id": "42.0", "state": []}]}')
@@ -238,12 +238,12 @@ class StepTests(unittest.TestCase):
         run.side_effect = subprocess.TimeoutExpired('squeue', 1)
         self.assertIsNone(s.Queue(timeout=1).fetch_steps())
 
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_empty_steps_are_a_successful_zero(self, run):
         run.return_value = subprocess.CompletedProcess([], 0, '{"steps": []}', '')
         self.assertEqual({}, s.Queue().fetch_steps())
 
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_only_running_steps_count(self, run):
         steps = [dict(id=f'42.{i}', state=[state]) for i, state in enumerate(
             ('RUNNING', 'COMPLETING', 'COMPLETED', 'CANCELLED', 'SUSPENDED', 'PENDING'))]
@@ -252,7 +252,7 @@ class StepTests(unittest.TestCase):
         run.return_value = subprocess.CompletedProcess([], 0, json.dumps({'steps': steps[1:]}), '')
         self.assertEqual({}, s.Queue().fetch_steps())
 
-    @patch('slurmjobs.subprocess.run')
+    @patch('hpc_dashboard.subprocess.run')
     def test_unsupported_step_json_not_retried_or_guessed(self, run):
         run.return_value = subprocess.CompletedProcess([], 1, '', 'unrecognized option --json')
         queue = s.Queue()
@@ -274,7 +274,7 @@ class StepTests(unittest.TestCase):
 
 
 class CacheTests(unittest.TestCase):
-    @patch('slurmjobs.time.monotonic')
+    @patch('hpc_dashboard.time.monotonic')
     def test_refresh_throttles_queue_and_updates_elapsed(self, clock):
         clock.return_value = 100
         job = s.from_json(raw_job(), 1000)
@@ -293,7 +293,7 @@ class CacheTests(unittest.TestCase):
         cache.fetch()
         self.assertEqual(queue.fetch.call_count, 2)
 
-    @patch('slurmjobs.time.monotonic')
+    @patch('hpc_dashboard.time.monotonic')
     def test_failure_preserves_good_snapshot_and_backs_off(self, clock):
         clock.return_value = 100
         queue = Mock()
@@ -309,7 +309,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(cache.fetch()[0].elapsed, 111)
         self.assertEqual(queue.fetch.call_count, 2)
 
-    @patch('slurmjobs.time.monotonic')
+    @patch('hpc_dashboard.time.monotonic')
     def test_slow_failure_backoff_from_completion_including_startup(self, clock):
         clock.return_value = 100
         queue = Mock()
@@ -337,7 +337,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(cache.fetch(), [])
         self.assertIsNone(cache.error)
 
-    @patch('slurmjobs.time.monotonic', return_value=100)
+    @patch('hpc_dashboard.time.monotonic', return_value=100)
     def test_pending_elapsed_not_extrapolated(self, clock):
         queue = Mock()
         queue.fetch.return_value = [s.from_json(raw_job(job_state=['PENDING']), 1000)]
@@ -394,9 +394,9 @@ class RefreshWorkerTests(unittest.TestCase):
 
 
 class WatchKeyTests(unittest.TestCase):
-    @patch('slurmjobs.time.monotonic', return_value=100)
-    @patch('slurmjobs.os.read')
-    @patch('slurmjobs.select.select')
+    @patch('hpc_dashboard.time.monotonic', return_value=100)
+    @patch('hpc_dashboard.os.read')
+    @patch('hpc_dashboard.select.select')
     def test_quit_keys(self, ready, read, clock):
         keys = s.WatchKeys()
         keys.fd = 3
@@ -405,26 +405,26 @@ class WatchKeyTests(unittest.TestCase):
             ready.side_effect = [([3], [], []), ([], [], [])]
             self.assertTrue(keys.wait(1), value)
 
-    @patch('slurmjobs.time.monotonic', return_value=100)
-    @patch('slurmjobs.os.read', return_value=b'\x1b[A')
-    @patch('slurmjobs.select.select', side_effect=[([3], [], []), ([], [], []), ([], [], [])])
+    @patch('hpc_dashboard.time.monotonic', return_value=100)
+    @patch('hpc_dashboard.os.read', return_value=b'\x1b[A')
+    @patch('hpc_dashboard.select.select', side_effect=[([3], [], []), ([], [], []), ([], [], [])])
     def test_arrow_does_not_quit(self, ready, read, clock):
         keys = s.WatchKeys()
         keys.fd = 3
         self.assertFalse(keys.wait(1))
 
-    @patch('slurmjobs.time.sleep')
+    @patch('hpc_dashboard.time.sleep')
     def test_redirected_input_falls_back_to_sleep(self, sleep):
         keys = s.WatchKeys()
         keys.fd = None
         self.assertFalse(keys.wait(1))
         sleep.assert_called_once_with(1)
 
-    @patch('slurmjobs.tty.setcbreak')
-    @patch('slurmjobs.termios.tcsetattr')
-    @patch('slurmjobs.termios.tcgetattr', side_effect=[[s.termios.IXON | s.termios.IXOFF, 0, 0, 0, 0, 0, []], [s.termios.IXON | s.termios.IXOFF, 0, 0, 0, 0, 0, []]])
-    @patch('slurmjobs.os.isatty', return_value=True)
-    @patch('slurmjobs.sys.stdin')
+    @patch('hpc_dashboard.tty.setcbreak')
+    @patch('hpc_dashboard.termios.tcsetattr')
+    @patch('hpc_dashboard.termios.tcgetattr', side_effect=[[s.termios.IXON | s.termios.IXOFF, 0, 0, 0, 0, 0, []], [s.termios.IXON | s.termios.IXOFF, 0, 0, 0, 0, 0, []]])
+    @patch('hpc_dashboard.os.isatty', return_value=True)
+    @patch('hpc_dashboard.sys.stdin')
     def test_terminal_restored_on_exception(self, stdin, isatty, get, restore, cbreak):
         stdin.fileno.return_value = 3
         with self.assertRaises(RuntimeError):
@@ -598,11 +598,11 @@ class RenderingTests(unittest.TestCase):
             with self.subTest(flags=flags, terminal=terminal):
                 with patch.object(s, 'Console') as console, \
                      patch.object(s, 'QueueCache') as queue, \
-                     patch('telemetry.Telemetry') as telemetry, \
+                     patch('hpc_dashboard_telemetry.Telemetry') as telemetry, \
                      patch.object(s, 'Live') as live, \
                      patch.object(s, 'RefreshWorker') as worker, \
                      patch.object(s, 'WatchKeys') as keys, \
-                     patch.object(s.sys, 'argv', ['sj'] + flags):
+                     patch.object(s.sys, 'argv', ['hpcd'] + flags):
                     console.return_value.is_terminal = terminal
                     console.return_value.width = 80
                     console.return_value.height = 24
@@ -625,7 +625,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_explicit_watch_rejects_pipe(self):
         with patch.object(s, 'Console') as console, \
-             patch.object(s.sys, 'argv', ['sj', '--watch']), \
+             patch.object(s.sys, 'argv', ['hpcd', '--watch']), \
              patch('sys.stderr', new=io.StringIO()):
             console.return_value.is_terminal = False
             with self.assertRaises(SystemExit) as exc:
@@ -663,9 +663,9 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(viewport.offset, 0)
         self.assertIn('0-0/30', show(height=1)[0])
 
-    @patch('slurmjobs.time.monotonic', return_value=100)
-    @patch('slurmjobs.os.read')
-    @patch('slurmjobs.select.select')
+    @patch('hpc_dashboard.time.monotonic', return_value=100)
+    @patch('hpc_dashboard.os.read')
+    @patch('hpc_dashboard.select.select')
     def test_navigation_input(self, ready, read, clock):
         keys = s.WatchKeys()
         keys.fd = 3
@@ -681,7 +681,7 @@ class RenderingTests(unittest.TestCase):
             self.assertEqual(keys.action, action)
 
     def test_watch_default_one_second(self):
-        with patch('slurmjobs.sys.argv', ['sj', '--help']):
+        with patch('hpc_dashboard.sys.argv', ['hpcd', '--help']):
             with patch('sys.stdout', new=io.StringIO()) as output:
                 with self.assertRaises(SystemExit) as exc:
                     s.main()

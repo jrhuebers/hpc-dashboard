@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, Mock
 
-import telemetry as t
+import hpc_dashboard_telemetry as t
 
 
 def job(**values):
@@ -30,6 +30,64 @@ class Clock:
     def patches(self):
         return (patch.object(t.time, 'time', side_effect=lambda: self.wall),
                 patch.object(t.time, 'monotonic', side_effect=lambda: self.monotonic))
+
+
+class MigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        home = patch.object(t.Path, 'home', return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+
+    def test_fresh_install_uses_new_private_cache(self):
+        root = t.cache_root()
+        self.assertEqual(self.home / '.cache/hpc-dashboard/telemetry', root)
+        self.assertEqual(0o700, root.stat().st_mode & 0o777)
+        self.assertFalse((self.home / '.cache/slurmjobs').exists())
+
+    def test_legacy_cache_locks_and_budget_are_reused(self):
+        legacy = self.home / '.cache/slurmjobs/telemetry'
+        directory = legacy / '123'
+        directory.mkdir(parents=True)
+        launch_lock = directory / 'launch.lock'
+        launch_lock.touch()
+        inode = launch_lock.stat().st_ino
+        t.atomic_json(directory / 'meta.json', {'starts': 2})
+        # Even if a new-name directory exists, never switch away from old locks.
+        (self.home / '.cache/hpc-dashboard/telemetry').mkdir(parents=True)
+        self.assertEqual(legacy, t.cache_root())
+        self.assertEqual(inode, launch_lock.stat().st_ino)
+        self.assertEqual(2, t.read_meta(directory / 'meta.json')['starts'])
+
+    def test_unsafe_legacy_cache_fails_closed(self):
+        legacy = self.home / '.cache/slurmjobs/telemetry'
+        legacy.parent.mkdir(parents=True)
+        target = self.home / 'target'
+        target.mkdir()
+        legacy.symlink_to(target)
+        with self.assertRaisesRegex(OSError, 'unsafe telemetry cache'):
+            t.cache_root()
+        self.assertFalse((self.home / '.cache/hpc-dashboard').exists())
+
+    def test_dangling_legacy_cache_fails_closed(self):
+        legacy = self.home / '.cache/slurmjobs/telemetry'
+        legacy.parent.mkdir(parents=True)
+        legacy.symlink_to(self.home / 'missing')
+        with self.assertRaises(OSError):
+            t.cache_root()
+        self.assertFalse((self.home / '.cache/hpc-dashboard').exists())
+
+    def test_old_and_new_steps_are_recognized_exactly(self):
+        for output, expected in [('sj-telemetry\n', True),
+                                 ('hpcd-telemetry\n', True),
+                                 ('batch\nhpcd-telemetry\n', True),
+                                 ('not-sj-telemetry\n', False),
+                                 ('', False), (None, None)]:
+            with self.subTest(output=output), patch.object(t, 'run', return_value=output) as run:
+                self.assertIs(expected, t.live_step('123', timeout=2))
+                self.assertEqual(2, run.call_args.args[1])
 
 
 class TelemetryTests(unittest.TestCase):
@@ -78,6 +136,15 @@ class TelemetryTests(unittest.TestCase):
         self.assertTrue(kwargs['start_new_session'])
         self.assertEqual(t.subprocess.DEVNULL, kwargs['stdin'])
         self.assertEqual(2, t.read_json(path / 'meta.json')['starts'])
+
+    @patch.object(t.subprocess, 'Popen')
+    @patch.object(t, 'run', return_value='sj-telemetry\n')
+    def test_legacy_step_blocks_duplicate_launch(self, run, popen):
+        directory = self.directory()
+        t.atomic_json(directory / 'meta.json', {'starts': 1, 'heartbeat': 0})
+        t.Telemetry('me')._launch(job(), directory)
+        popen.assert_not_called()
+        self.assertEqual(1, t.read_meta(directory / 'meta.json')['starts'])
 
     @patch.object(t.subprocess, 'Popen')
     def test_stale_live_step_and_scheduler_failure_never_launch(self, popen):
@@ -554,7 +621,7 @@ class TelemetryTests(unittest.TestCase):
         t.supervisor('123', 2, 8, 8192)
         command = popen.call_args.args[0]
         for arg in ('--overlap', '--exact', '--immediate=10', '--nodes=2',
-                    '--ntasks-per-node=1', '--cpus-per-task=1', '--job-name=sj-telemetry'):
+                    '--ntasks-per-node=1', '--cpus-per-task=1', '--job-name=hpcd-telemetry'):
             self.assertIn(arg, command)
         self.assertNotIn('--gres=none', command)
         proc.terminate.assert_not_called()

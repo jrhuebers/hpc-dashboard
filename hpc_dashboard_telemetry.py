@@ -23,7 +23,9 @@ import subprocess
 import sys
 import time
 
-NAME = 'sj-telemetry'
+NAME = 'hpcd-telemetry'
+# Recognize pre-rename collectors without spending another monitoring step ID.
+LEGACY_NAME = 'sj-telemetry'
 STALE = 45
 SAMPLE_STALE = 5
 CLOCK_SKEW = 1  # Small clock offsets between compute and dashboard hosts.
@@ -40,7 +42,11 @@ JOB_ID = re.compile(r'\d+(?:_\d+)?(?:\+\d+)?\Z')
 
 
 def cache_root():
-    root = Path.home() / '.cache' / 'slurmjobs' / 'telemetry'
+    base = Path.home() / '.cache'
+    legacy = base / 'slurmjobs' / 'telemetry'
+    # Do not move live collectors' lock files or reset their lifetime budgets.
+    # Existing installations share the old state; fresh installs use the new name.
+    root = legacy if legacy.exists() or legacy.is_symlink() else base / 'hpc-dashboard' / 'telemetry'
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if root.is_symlink() or root.stat().st_uid != os.getuid():
         raise OSError('unsafe telemetry cache')
@@ -131,7 +137,7 @@ def run(args, timeout=10):
 def live_step(jobid, timeout=10):
     output = run(['squeue', '--steps', '--jobs', jobid, '--noheader',
                   '--format=%j'], timeout)
-    return None if output is None else NAME in output.splitlines()
+    return None if output is None else bool({NAME, LEGACY_NAME}.intersection(output.splitlines()))
 
 
 def job_ended(jobid, timeout=10):
@@ -483,7 +489,7 @@ def cleanup(root, now=None, timeout=10):
 
 
 def launch_env():
-    # An sj invocation may itself run inside a different allocation.
+    # An hpcd invocation may itself run inside a different allocation.
     return {k: v for k, v in os.environ.items()
             if not k.startswith(('SLURM_', 'SRUN_'))}
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vertically formatted Slurm queue viewer with optional job telemetry."""
+"""HPC Dashboard: fullscreen Slurm queue and resource telemetry."""
 import argparse
 import getpass
 import json
@@ -421,7 +421,7 @@ class RefreshWorker:
         self.results = queues.Queue(maxsize=1)
         self.wake = threading.Event()
         self.closed = threading.Event()
-        self.thread = threading.Thread(target=self._run, name='sj-refresh', daemon=True)
+        self.thread = threading.Thread(target=self._run, name='hpcd-refresh', daemon=True)
 
     def __enter__(self):
         self.thread.start()
@@ -584,7 +584,7 @@ def positive(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Fullscreen Slurm dashboard with usage enabled by default. Collectors persist in your jobs. Time is elapsed/limit.')
+    parser = argparse.ArgumentParser(description='HPC Dashboard: fullscreen Slurm dashboard with usage enabled by default. Collectors persist in your jobs. Time is elapsed/limit.')
     parser.add_argument('--me', action='store_true', help='show only your jobs')
     parser.add_argument('--watch', action=argparse.BooleanOptionalAction, default=None, help='fullscreen refresh (default on terminals); q, Escape, or Ctrl-C to stop; --no-watch for a snapshot')
     parser.add_argument('--interval', type=positive, default=1, help='display refresh in seconds (default: 1; queue queried every 10s)')
@@ -602,9 +602,9 @@ def main():
     queue = QueueCache(Queue(args.timeout), user if args.me else None)
     telemetry = None
     if args.usage:
-        # Resolve sibling module even when invoked through ~/.local/bin/sj.
+        # Resolve sibling module even when invoked through ~/.local/bin/hpcd.
         sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-        from telemetry import Telemetry
+        from hpc_dashboard_telemetry import Telemetry
         telemetry = Telemetry(user, timeout=args.timeout)
     def frame():
         jobs = queue.fetch()
@@ -676,7 +676,7 @@ def main():
     except BrokenPipeError:
         return 0
     except (RuntimeError, ValueError, TypeError, KeyError) as exc:
-        Console(stderr=True, no_color=args.no_color).print(Text('slurmjobs: ' + clean(exc), style='red'))
+        Console(stderr=True, no_color=args.no_color).print(Text('hpc-dashboard: ' + clean(exc), style='red'))
         return 1
 
 

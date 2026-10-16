@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpc-dashboard"
+version = "0.1.0"
+description = "Fullscreen terminal dashboard for HPC jobs and resource telemetry"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["rich>=12"]
+
+[project.urls]
+Repository = "https://github.com/jrhuebers/hpc-dashboard"
+Issues = "https://github.com/jrhuebers/hpc-dashboard/issues"
+
+[project.scripts]
+hpc-dashboard = "hpc_dashboard:main"
+hpcd = "hpc_dashboard:main"
+
+[tool.setuptools]
+py-modules = ["hpc_dashboard", "hpc_dashboard_telemetry"]

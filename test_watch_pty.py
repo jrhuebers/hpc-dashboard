@@ -18,7 +18,7 @@ CHILD = r'''
 import fcntl, getpass, os, sys, termios, threading, time
 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 sys.path.insert(0, sys.argv[1])
-import slurmjobs as s
+import hpc_dashboard as s
 status, stall_at = int(sys.argv[2]), int(sys.argv[3])
 class FakeQueue:
     def __init__(self, timeout): self.calls = 0
@@ -36,7 +36,7 @@ class FakeQueue:
 s.Queue = FakeQueue
 original = s.QueueCache
 s.QueueCache = lambda queue, user: original(queue, user, interval=0.2)
-sys.argv = ['sj', '--no-usage', '--interval', '0.1']
+sys.argv = ['hpcd', '--no-usage', '--interval', '0.1']
 sys.exit(s.main())
 '''
 
