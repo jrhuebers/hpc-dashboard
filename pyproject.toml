@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpc-dashboard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fullscreen terminal dashboard for HPC jobs and resource telemetry"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,4 +19,4 @@ hpc-dashboard = "hpc_dashboard:main"
 hpcd = "hpc_dashboard:main"
 
 [tool.setuptools]
-py-modules = ["hpc_dashboard", "hpc_dashboard_telemetry"]
+py-modules = ["hpc_dashboard", "hpc_dashboard_model", "hpc_dashboard_runai", "hpc_dashboard_telemetry"]

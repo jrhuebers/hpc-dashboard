@@ -1,12 +1,12 @@
 # HPC Dashboard
 
-A standalone terminal dashboard, available as `hpc-dashboard` or `hpcd`. Currently supports Slurm only; RunAI support is not implemented.
+A standalone terminal dashboard, available as `hpc-dashboard` or `hpcd`, with Slurm and Run:AI/Kubernetes backends. Finished Run:AI workloads are hidden by default.
 
-An indented Slurm queue viewer for cluster hosts with Python 3, Rich, and `squeue`. By default it opens a fullscreen watch dashboard with usage enabled, starting/reusing persistent telemetry steps in your own running allocations. Use `--no-usage` for read-only operation and `--no-watch` for a snapshot. Your jobs appear first, followed by other users grouped by username. Section and username headers use white text on black backgrounds; detail labels and empty-state text use darker grey (`#707070`). There are no blank spacer lines within either section; a single blank line separates your jobs from the other-users section.
+An indented workload viewer for hosts with Python 3 and Rich. Backend auto-detection selects Slurm when only `squeue` is installed or Run:AI when only `kubectl` is installed; if both clients are installed, select `--backend slurm` or `--backend runai` explicitly. It opens a fullscreen watch dashboard on terminals. The Run:AI backend is strictly read-only and never launches collectors or executes commands inside containers. On Slurm, usage is enabled by default, starting/reusing persistent telemetry steps in your own running allocations. Use `--no-usage` for read-only Slurm operation and `--no-watch` for a snapshot. Your jobs appear first, followed by other users grouped by username. Section and username headers use white text on black backgrounds; detail labels and empty-state text use darker grey (`#707070`). There are no blank spacer lines within either section; a single blank line separates your jobs from the other-users section.
 
 ## Install
 
-Requires Python 3.10+, Rich, and Slurm client commands (`squeue`; `srun` and `sstat` for telemetry). GPU readings additionally need `nvidia-smi` on the allocated nodes. Source and tests live at the root of this repository, not in dotfiles. This tool is intended for POSIX Slurm cluster hosts, not personal systems without Slurm.
+Requires Python 3.10+ and Rich on POSIX. Slurm needs `squeue` (`srun` and `sstat` for telemetry); GPU readings additionally need `nvidia-smi` on the allocated nodes. Run:AI needs an authenticated `kubectl` context and namespace read permissions; `runai` is needed only for automatic accessible-project discovery. No Kubernetes Python package or Run:AI CLI upgrade is required. Source and tests live at the root of this repository, not in dotfiles.
 
 Clone and install into an isolated user-local environment with uv:
 
@@ -44,7 +44,32 @@ Fresh installations store telemetry in `~/.cache/hpc-dashboard/telemetry/`. If `
 
 The source history was extracted from `jrhuebers/dotfiles` using `git subtree split --prefix=tools/slurmjobs`; unrelated dotfiles history is not included.
 
-## Usage
+## Run:AI / Kubernetes
+
+```sh
+hpcd --backend runai
+hpcd --backend runai --project my-project
+hpcd --backend runai --project my-project --project another-project
+hpcd --backend runai --namespace my-custom-namespace
+hpcd --backend runai --context my-cluster --project my-project
+hpcd --backend runai --me --no-watch --no-usage
+hpcd --backend runai --state running
+hpcd --backend runai --state running,pending
+hpcd --backend runai --include-finished
+hpcd --backend runai --state failed --include-finished
+```
+
+The default view excludes retained succeeded, failed, cancelled, stopped, and deleted workloads. `--include-finished` includes retained terminal objects, not an accounting archive; deleted Kubernetes objects cannot be recovered. An explicit `--state` filter takes precedence over the default and `--include-finished`, so `--state failed` also works by itself. State names are case-insensitive; canonical terminal names are `succeeded`, `failed`, `cancelled`, `stopped`, and `deleted`.
+
+Without project/namespace flags, accessible projects are discovered through `runai list projects` and cached for five minutes. Explicit projects conventionally map to `runai-<project>` namespaces; use `--namespace` for nonstandard mappings. Kubernetes's cluster-wide Project catalog is not treated as an authorization list. No cluster-wide Pod listing is attempted. Explicit `--context` requires explicit project/namespace flags to avoid mixing the Kubernetes context with a different Run:AI CLI cluster. The resolved Kubernetes context is pinned for the lifetime of the dashboard; it never changes your CLI configuration. Own-job identity comes from `kubectl auth whoami`, not the local Unix login. Use `--user EMAIL` when identity discovery is unavailable or the workload owner uses a different identity.
+
+The backend reads available training, interactive, distributed, inference, and distributed-inference workload types, plus legacy `RunaiJob` objects and Pods. Higher-level workload objects take precedence over child controllers; owner UIDs, owned-resource UIDs, and top-owner labels join Pod attempts without matching stale objects solely by a reused name. One row represents a workload, with running/pending Pod counts and failed Pod-attempt counts. Missing owner information may require a legacy job or orphan Pod row. Queue refreshes use batched queries per namespace, not per-workload queries. Unknown and inaccessible fields remain unknown, not zero. Partial query failures are visible warnings; previous complete namespace snapshots are retained where available, and cached values are not presented as new measurements.
+
+The header shows the Kubernetes context and selected projects. Detail lines show project/node location, assigned GPU models where node metadata is readable, requested and allocated GPU quantities, fractional CPU requests, RAM requests, purpose, and research tag. The `purpose` annotation (with `comment` fallback) supplies explanatory text; a custom `project` label supplies the research tag when distinct from the scheduling project. Only running/nonterminal Pod resource requests contribute to current CPU/RAM totals, so retained failed attempts do not inflate allocations. GPU fractions and GPU memory limits are not measurements of compute utilization or billing. Time is elapsed wall time from available start/completion timestamps, not GPU-active time; absent deadlines remain unknown.
+
+Run:AI utilization monitoring is not implemented in this release. With usage enabled, own running jobs explicitly show that metrics are unavailable; `--no-usage` suppresses this line. The backend never starts Slurm collectors, injects containers, uses `kubectl exec`, submits jobs, or modifies workloads. Node metadata is optional. Credentials remain with the native CLI; the backend does not read kubeconfig files or Kubernetes Secrets. Kubernetes output is narrowly projected before entering the dashboard: only allowlisted identity/resource/status/metadata fields and the single `RUNAI_GPU_MEMORY_LIMIT` variable are returned, not arbitrary environment values, commands, annotations, volume definitions, or raw Pod documents.
+
+## Slurm usage
 
 ```sh
 hpc-dashboard
@@ -91,10 +116,12 @@ After confirmed job completion, the detached supervisor waits one hour locally (
 hpcd --help
 hpcd --me --no-watch --no-usage --no-color
 cd ~/hpc-dashboard
-python3 -m unittest -v test_hpc_dashboard test_telemetry test_watch_pty
+python3 -m unittest -v test_hpc_dashboard test_telemetry test_watch_pty test_runai
 ```
 
-Tests use offline fixtures and mocked commands, so they do not submit or alter jobs. They cover rendering, scrolling and navigation, queue-query caching/backoff, JSON/legacy parsing, scheduler failures, telemetry parsing, cache lifecycle, and collector launch safeguards. Isolated pseudo-terminal regressions cover stalled initial/subsequent refreshes, cached-content scrolling, q/Escape/Ctrl-C exit, Ctrl-S immunity, alternate-screen/mouse cleanup, and exact terminal-setting restoration.
+For Run:AI read-only verification, use `hpcd --backend runai --me --no-watch --no-usage --no-color --timeout 5`, then repeat with `--include-finished` to inspect retained jobs.
+
+Tests use offline fixtures and mocked commands, so they do not submit or alter jobs. Run:AI coverage includes default terminal filtering, SSO identity, context selection, namespace permissions, fractional resource quantities, owner graph deduplication, distributed/retry Pods, unavailable data, safe output projection, and backend isolation. They cover rendering, scrolling and navigation, queue-query caching/backoff, JSON/legacy parsing, scheduler failures, telemetry parsing, cache lifecycle, and collector launch safeguards. Isolated pseudo-terminal regressions cover stalled initial/subsequent refreshes, cached-content scrolling, q/Escape/Ctrl-C exit, Ctrl-S immunity, alternate-screen/mouse cleanup, and exact terminal-setting restoration.
 
 ## Remove
 

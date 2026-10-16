@@ -12,5 +12,5 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install .
-      - run: python -m unittest -v test_hpc_dashboard test_telemetry test_watch_pty
+      - run: python -m unittest -v test_hpc_dashboard test_telemetry test_watch_pty test_runai
       - run: hpc-dashboard --help && hpcd --help

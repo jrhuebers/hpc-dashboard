@@ -36,12 +36,14 @@ class FakeQueue:
 s.Queue = FakeQueue
 original = s.QueueCache
 s.QueueCache = lambda queue, user: original(queue, user, interval=0.2)
-sys.argv = ['hpcd', '--no-usage', '--interval', '0.1']
+sys.argv = ['hpcd', '--backend', 'slurm', '--no-usage', '--interval', '0.1']
 sys.exit(s.main())
 '''
 
 
 class WatchPTYTests(unittest.TestCase):
+    child = CHILD
+
     def launch(self, stall_at=1):
         self.master, self.slave = pty.openpty()
         attrs = termios.tcgetattr(self.slave)
@@ -51,7 +53,7 @@ class WatchPTYTests(unittest.TestCase):
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 100, 0, 0))
         self.status, writer = os.pipe()
         self.proc = subprocess.Popen(
-            [sys.executable, '-c', CHILD, str(Path(__file__).parent), str(writer), str(stall_at)],
+            [sys.executable, '-c', self.child, str(Path(__file__).parent), str(writer), str(stall_at)],
             stdin=self.slave, stdout=self.slave, stderr=self.slave,
             pass_fds=(writer,), start_new_session=True)
         os.close(writer)
@@ -146,6 +148,28 @@ class WatchPTYTests(unittest.TestCase):
         self.until(lambda: b'last display' in self.output)
         self.assertEqual(self.markers.count(b'FETCH'), 2)
         self.quit()
+
+
+RUNAI_CHILD = CHILD.replace("s.Queue = FakeQueue", '''
+import hpc_dashboard_runai as r
+from dataclasses import replace
+class FakeRunaiQueue(FakeQueue):
+    supports_steps = False
+    context = 'fixture-cluster'
+    scopes = [('fixture-project', 'runai-fixture-project')]
+    warnings = []
+    user = getpass.getuser()
+    def __init__(self, timeout, **kwargs): super().__init__(timeout)
+    def fetch(self, user):
+        return [replace(j, id=j.id + '/' + j.name, backend='runai', uid=j.id,
+                        pod_summary='1 running / 0 pending Pods')
+                for j in super().fetch(user)]
+r.RunaiQueue = FakeRunaiQueue
+''').replace("'--backend', 'slurm'", "'--backend', 'runai'")
+
+
+class RunaiWatchPTYTests(WatchPTYTests):
+    child = RUNAI_CHILD
 
 
 if __name__ == '__main__':

@@ -602,7 +602,7 @@ class RenderingTests(unittest.TestCase):
                      patch.object(s, 'Live') as live, \
                      patch.object(s, 'RefreshWorker') as worker, \
                      patch.object(s, 'WatchKeys') as keys, \
-                     patch.object(s.sys, 'argv', ['hpcd'] + flags):
+                     patch.object(s.sys, 'argv', ['hpcd', '--backend', 'slurm'] + flags):
                     console.return_value.is_terminal = terminal
                     console.return_value.width = 80
                     console.return_value.height = 24

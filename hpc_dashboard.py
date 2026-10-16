@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HPC Dashboard: fullscreen Slurm queue and resource telemetry."""
+"""HPC Dashboard: fullscreen Slurm and Run:AI workload dashboard."""
 import argparse
 import getpass
 import json
@@ -7,6 +7,7 @@ import math
 import os
 import re
 import select
+import shutil
 import queue as queues
 import subprocess
 import threading
@@ -15,7 +16,9 @@ import tty
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import replace
+
+from hpc_dashboard_model import Job, clean
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -30,11 +33,6 @@ def number(value, default=0):
             return math.inf
         return value.get('number', default) if value.get('set', True) else default
     return default if value is None else value
-
-
-def clean(value):
-    # Job names/comments are untrusted terminal input, not Rich markup.
-    return ''.join(c if c.isprintable() or c == '\n' else ' ' for c in str(value or ''))
 
 
 def duration(seconds):
@@ -111,25 +109,6 @@ def gpu_label(resources, requested=''):
     return 'no GPU'
 
 
-@dataclass
-class Job:
-    id: str
-    name: str
-    user: str
-    state: str
-    partition: str
-    nodes: str
-    cpus: int
-    memory: float | None
-    gpu: str
-    elapsed: float
-    limit: float | None
-    comment: str = ''
-    reason: str = ''
-    step_count: int | None = None
-    steps_queried: bool = False
-
-
 def from_json(raw, now):
     states = raw.get('job_state', [])
     state = ', '.join(states) if isinstance(states, list) else str(states)
@@ -201,6 +180,9 @@ def from_text(line):
 
 
 class Queue:
+    """Slurm backend. Retains legacy JSON/text fallback and telemetry semantics."""
+    supports_steps = True
+
     def __init__(self, timeout=10):
         self.timeout = timeout
         self.legacy = False
@@ -280,9 +262,11 @@ class Queue:
 def job_lines(job, indent='', compact=False, usage=None, width=None):
     state_color = 'green' if job.state == 'RUNNING' else 'yellow' if job.state == 'PENDING' else 'cyan'
     # Reserve a right-hand status column; preserve complete names on the left.
-    title = Text(indent + job.id + ' · ' + job.name, style='bold', overflow='fold')
+    title = Text(indent + (job.id if job.backend == 'runai' else job.id + ' · ' + job.name), style='bold', overflow='fold')
     status = Text('')
     status.append(job.state, style=state_color)
+    if job.pod_summary:
+        status.append(' · ' + job.pod_summary, style=GREY)
     if job.steps_queried:
         if job.step_count is None:
             status.append(' · running steps ?', style=GREY)
@@ -305,11 +289,13 @@ def job_lines(job, indent='', compact=False, usage=None, width=None):
         text = Text(indent + '  ' + f'{label:<11}', style=GREY, overflow='fold')
         text.append(value, style='default')
         return text
+    if job.tag.strip():
+        yield detail('Tag', job.tag)
     if job.comment.strip():
-        yield detail('Comment', job.comment)
+        yield detail('Purpose' if job.backend == 'runai' else 'Comment', job.comment)
     yield detail('Location', job.partition + ' · ' + (job.nodes or 'not allocated'))
-    resources = f'{job.gpu} · {memory_label(job.memory)} · {job.cpus} CPUs'
-    timing = duration(job.elapsed) + '/' + (duration(job.limit) if job.limit is not None else 'unknown')
+    resources = job.resource_details or f'{job.gpu} · {memory_label(job.memory)} · {job.cpus} CPUs'
+    timing = (duration(job.elapsed) if job.elapsed is not None else 'unknown') + '/' + (duration(job.limit) if job.limit is not None else 'unknown')
     if compact:
         yield detail('Resources', resources + ' · Time ' + timing)
     else:
@@ -324,8 +310,8 @@ def job_lines(job, indent='', compact=False, usage=None, width=None):
             if separator:
                 value = cpu_ram + '\nGPU ' + gpu_vram
         yield detail('Usage', value)
-    if job.state == 'PENDING' and job.reason not in ('', 'None', '(null)'):
-        yield detail('Waiting', job.reason)
+    if job.reason not in ('', 'None', '(null)') and (job.state == 'PENDING' or job.backend == 'runai'):
+        yield detail('Waiting' if job.state == 'PENDING' else 'Reason', job.reason)
 
 
 def wrap_lines(lines, width):
@@ -335,7 +321,7 @@ def wrap_lines(lines, width):
     for line in lines:
         plain = line.plain
         indent = len(plain) - len(plain.lstrip(' '))
-        detail = plain.lstrip().startswith(('Comment ', 'Location ', 'Resources ', 'Time ', 'Waiting ', 'Usage '))
+        detail = plain.lstrip().startswith(('Comment ', 'Purpose ', 'Tag ', 'Location ', 'Resources ', 'Time ', 'Waiting ', 'Reason ', 'Usage '))
         prefix = indent + 11 if detail else indent + 2
         if not plain or line.cell_len <= width and '\n' not in plain:
             result.append(line)
@@ -391,10 +377,13 @@ class QueueCache:
             # Back off from completion, including slow failures and initial errors.
             try:
                 jobs = self.queue.fetch(self.user)
-                counts = self.queue.fetch_steps(self.user)
-                self.jobs = [replace(job, step_count=counts.get(job.id, 0) if counts is not None else None,
-                                     steps_queried=True) for job in jobs]
-                self.error = None
+                if getattr(self.queue, 'supports_steps', True):
+                    counts = self.queue.fetch_steps(self.user)
+                    jobs = [replace(job, step_count=counts.get(job.id, 0) if counts is not None else None,
+                                    steps_queried=True) for job in jobs]
+                self.jobs = jobs
+                warnings = getattr(self.queue, 'warnings', [])
+                self.error = '; '.join(warnings) if isinstance(warnings, list) and warnings else None
                 self.fetched = time.monotonic()
             except Exception as exc:
                 self.error = clean(exc)
@@ -405,7 +394,7 @@ class QueueCache:
             raise RuntimeError(self.error or 'Queue unavailable')
         age = max(0, now - self.fetched)
         return [replace(job, elapsed=job.elapsed + age)
-                if job.state == 'RUNNING' else job for job in self.jobs]
+                if job.state == 'RUNNING' and job.elapsed is not None and (job.backend == 'slurm' or not self.error) else job for job in self.jobs]
 
 
 class RefreshWorker:
@@ -583,12 +572,33 @@ def positive(value):
     return result
 
 
+def choose_backend(requested):
+    if requested != 'auto':
+        return requested
+    slurm = bool(shutil.which('squeue'))
+    runai = bool(shutil.which('kubectl'))
+    if slurm and runai:
+        raise RuntimeError('Both scheduler clients found; select --backend slurm or --backend runai')
+    if slurm:
+        return 'slurm'
+    if runai:
+        return 'runai'
+    raise RuntimeError('No scheduler client found; install squeue or kubectl')
+
+
 def main():
-    parser = argparse.ArgumentParser(description='HPC Dashboard: fullscreen Slurm dashboard with usage enabled by default. Collectors persist in your jobs. Time is elapsed/limit.')
+    parser = argparse.ArgumentParser(description='HPC Dashboard: fullscreen Slurm/Run:AI dashboard. Active jobs only by default. Slurm usage collectors persist in your jobs; Run:AI is read-only. Time is elapsed/limit.')
+    parser.add_argument('--backend', choices=('auto', 'slurm', 'runai'), default='auto', help='scheduler backend (auto detects installed clients; ambiguous hosts require explicit selection)')
+    parser.add_argument('-p', '--project', action='append', default=[], help='Run:AI project; repeat for multiple projects (default: accessible Run:AI projects)')
+    parser.add_argument('--namespace', action='append', default=[], help='explicit Kubernetes namespace; repeat to select multiple namespaces')
+    parser.add_argument('--context', help='Kubernetes context; requires --project or --namespace')
+    parser.add_argument('--user', help='override own-job identity (Run:AI normally uses kubectl auth whoami)')
+    parser.add_argument('--state', action='append', default=[], help='show only this state; repeat or use comma-separated states, e.g. running,pending')
+    parser.add_argument('--include-finished', action='store_true', help='also show retained terminal Run:AI workloads; --state takes precedence')
     parser.add_argument('--me', action='store_true', help='show only your jobs')
     parser.add_argument('--watch', action=argparse.BooleanOptionalAction, default=None, help='fullscreen refresh (default on terminals); q, Escape, or Ctrl-C to stop; --no-watch for a snapshot')
     parser.add_argument('--interval', type=positive, default=1, help='display refresh in seconds (default: 1; queue queried every 10s)')
-    parser.add_argument('--usage', action=argparse.BooleanOptionalAction, default=True, help='start/reuse persistent CPU/RAM/GPU collectors for your running jobs (default: enabled; --no-usage for read-only)')
+    parser.add_argument('--usage', action=argparse.BooleanOptionalAction, default=True, help='Slurm: start/reuse persistent collectors (default: enabled); Run:AI: show utilization unavailable, never launch collectors')
     parser.add_argument('--timeout', type=positive, default=10, help='scheduler query timeout (default: 10)')
     parser.add_argument('--compact', action='store_true', help='combine resources and time')
     parser.add_argument('--no-color', action='store_true', help='disable colors')
@@ -599,16 +609,35 @@ def main():
         args.watch = console.is_terminal
     if args.watch and not console.is_terminal:
         parser.error('--watch requires a terminal; use --no-watch for piped output')
-    queue = QueueCache(Queue(args.timeout), user if args.me else None)
+    try:
+        backend = choose_backend(args.backend)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    if backend == 'slurm' and (args.project or args.namespace or args.context or args.include_finished):
+        parser.error('--project, --namespace, --context and --include-finished require --backend runai')
+    states = [state.strip().upper() for value in args.state for state in value.split(',') if state.strip()]
+    user = args.user or user
+    scheduler = Queue(args.timeout)
+    if backend == 'runai':
+        from hpc_dashboard_runai import RunaiQueue
+        scheduler = RunaiQueue(args.timeout, projects=args.project, namespaces=args.namespace,
+                               context=args.context, include_finished=args.include_finished,
+                               states=states, user=args.user)
+    queue = QueueCache(scheduler, user if args.me else None)
     telemetry = None
-    if args.usage:
+    if args.usage and backend == 'slurm':
         # Resolve sibling module even when invoked through ~/.local/bin/hpcd.
         sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
         from hpc_dashboard_telemetry import Telemetry
         telemetry = Telemetry(user, timeout=args.timeout)
     def frame():
         jobs = queue.fetch()
+        if backend == 'slurm' and states:
+            jobs = [job for job in jobs if job.state in states]
         usage = None
+        if backend == 'runai' and args.usage:
+            usage = {job.id: 'Unavailable: Run:AI metrics not configured (no collectors started)'
+                     for job in jobs if job.user == scheduler.user and job.state == 'RUNNING'}
         if telemetry is not None:
             try:
                 usage = telemetry.fetch(jobs)
@@ -618,10 +647,19 @@ def main():
         return jobs, usage, queue.error
     def display(snapshot):
         jobs, usage, _ = snapshot
-        return render(jobs, user, args.compact, console.width, usage=usage)
+        identity = scheduler.user if backend == 'runai' else user
+        content = render(jobs, identity or user, args.compact, console.width, usage=usage)
+        if backend == 'runai':
+            scopes = ', '.join(project for project, _ in scheduler.scopes or [])
+            heading = Text('RUN:AI · ' + clean(scheduler.context) + ' · ' + clean(scopes), style=GREY)
+            content = Group(*wrap_lines([heading], console.width), *content.renderables)
+        return content
     try:
         if not args.watch:
-            console.print(display(frame()))
+            snapshot = frame()
+            console.print(display(snapshot))
+            if snapshot[2]:
+                Console(stderr=True, no_color=args.no_color).print(Text('hpc-dashboard: ' + clean(snapshot[2]), style='yellow'))
             return 0
         # Enter the terminal before the first fetch; even startup is cancellable.
         initial = Group(Text('Loading queue…', style=GREY))
