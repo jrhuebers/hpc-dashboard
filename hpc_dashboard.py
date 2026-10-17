@@ -362,7 +362,7 @@ def render(jobs, user, compact=False, width=80, usage=None):
 
 class QueueCache:
     """Render at 1 Hz without polling the scheduler at 1 Hz."""
-    def __init__(self, queue, user=None, interval=10):
+    def __init__(self, queue, user=None, interval=5):
         self.queue = queue
         self.user = user
         self.interval = interval
@@ -597,7 +597,7 @@ def main():
     parser.add_argument('--include-finished', action='store_true', help='also show retained terminal Run:AI workloads; --state takes precedence')
     parser.add_argument('--me', action='store_true', help='show only your jobs')
     parser.add_argument('--watch', action=argparse.BooleanOptionalAction, default=None, help='fullscreen refresh (default on terminals); q, Escape, or Ctrl-C to stop; --no-watch for a snapshot')
-    parser.add_argument('--interval', type=positive, default=1, help='display refresh in seconds (default: 1; queue queried every 10s)')
+    parser.add_argument('--interval', type=positive, default=1, help='display refresh in seconds (default: 1; queue queried every 5s)')
     parser.add_argument('--usage', action=argparse.BooleanOptionalAction, default=True, help='Slurm: start/reuse persistent collectors (default: enabled); Run:AI: show utilization unavailable, never launch collectors')
     parser.add_argument('--timeout', type=positive, default=10, help='scheduler query timeout (default: 10)')
     parser.add_argument('--compact', action='store_true', help='combine resources and time')

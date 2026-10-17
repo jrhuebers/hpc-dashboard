@@ -289,7 +289,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(cache.fetch()[0].step_count, 3)
         queue.fetch_steps.assert_called_once_with('me')
         queue.fetch.assert_called_once_with('me')
-        clock.return_value = 110
+        clock.return_value = 105
         cache.fetch()
         self.assertEqual(queue.fetch.call_count, 2)
 
@@ -321,16 +321,16 @@ class CacheTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'offline'):
             cache.fetch()
         self.assertEqual(cache.attempted, 110)
-        clock.return_value = 119
+        clock.return_value = 114
         with self.assertRaisesRegex(RuntimeError, 'offline'):
             cache.fetch()
         self.assertEqual(queue.fetch.call_count, 1)
-        clock.return_value = 120
+        clock.return_value = 115
         with self.assertRaisesRegex(RuntimeError, 'offline'):
             cache.fetch()
         self.assertEqual(queue.fetch.call_count, 2)
-        self.assertEqual(cache.attempted, 130)
-        clock.return_value = 140
+        self.assertEqual(cache.attempted, 125)
+        clock.return_value = 130
         queue.fetch.side_effect = None
         queue.fetch.return_value = []
         queue.fetch_steps.return_value = {}

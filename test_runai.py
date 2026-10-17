@@ -372,8 +372,8 @@ class QueueTests(unittest.TestCase):
         jobs = cache.fetch()
         self.assertFalse(jobs[0].steps_queried)
         q.fetch_steps.assert_not_called()
-        clock.return_value = 105
-        self.assertEqual(cache.fetch()[0].elapsed, jobs[0].elapsed + 5)
+        clock.return_value = 104
+        self.assertEqual(cache.fetch()[0].elapsed, jobs[0].elapsed + 4)
 
 
 class CLITests(unittest.TestCase):

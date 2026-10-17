@@ -675,7 +675,7 @@ class TelemetryTests(unittest.TestCase):
             clock.advance(0.1)
             t.cleanup(self.root)
             self.assertEqual(2, ended.call_count)
-            self.assertEqual(40, t._CLEANUP_AT[str(self.root)])
+            self.assertEqual(35, t._CLEANUP_AT[str(self.root)])
 
     def test_cleanup_directory_error_still_sets_completion_cooldown(self):
         clock = Clock(wall=2 * t.TTL)
@@ -876,28 +876,28 @@ class TelemetryTests(unittest.TestCase):
             self.assertNotIn('stale', status)
             # Slow queries must not cause another query on the next frame.
             telemetry.fetch([job()])
-            clock.advance(9)
+            clock.advance(4)
             telemetry.fetch([job()])
             run.assert_called_once()
             clock.advance(1)
             status = telemetry.fetch([job()])['123']
-            self.assertEqual(140, telemetry.accounting_at)
-            self.assertEqual(40, telemetry.accounting_checked_at)
-            self.assertIn('CPU 2.0/8 cores', status)  # 50 CPU seconds / 25 elapsed.
+            self.assertEqual(135, telemetry.accounting_at)
+            self.assertEqual(35, telemetry.accounting_checked_at)
+            self.assertIn('CPU 2.5/8 cores', status)  # 50 CPU seconds / 20 elapsed.
             self.assertIn('RSS 2.0 GiB', status)
             self.assertNotIn('stale', status)
-            clock.advance(10)
+            clock.advance(5)
             status = telemetry.fetch([job()])['123']
-            self.assertEqual(140, telemetry.accounting_at)  # Failed reads retain age.
-            self.assertEqual(65, telemetry.accounting_checked_at)
-            self.assertIn('RSS 2.0 GiB (stale, 25s old)', status)
+            self.assertEqual(135, telemetry.accounting_at)  # Failed reads retain age.
+            self.assertEqual(55, telemetry.accounting_checked_at)
+            self.assertIn('RSS 2.0 GiB (stale, 20s old)', status)
             telemetry.fetch([job()])
             self.assertEqual(3, run.call_count)
-            clock.advance(10)
+            clock.advance(5)
             status = telemetry.fetch([job()])['123']
-            self.assertEqual(190, telemetry.accounting_at)
-            self.assertEqual(90, telemetry.accounting_checked_at)
-            self.assertIn('RSS 2.0 GiB (stale, 50s old)', status)
+            self.assertEqual(175, telemetry.accounting_at)
+            self.assertEqual(75, telemetry.accounting_checked_at)
+            self.assertIn('RSS 2.0 GiB (stale, 40s old)', status)
             self.assertEqual(4, run.call_count)
 
     @patch.object(t, 'cleanup')
@@ -913,7 +913,7 @@ class TelemetryTests(unittest.TestCase):
             telemetry.fetch([job()])
             run.assert_called_once()
             clock.wall -= 20000
-            clock.advance(10)
+            clock.advance(t.ACCOUNTING_INTERVAL)
             telemetry.fetch([job()])
             self.assertEqual(2, run.call_count)
 

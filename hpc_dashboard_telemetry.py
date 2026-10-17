@@ -31,7 +31,7 @@ SAMPLE_STALE = 5
 CLOCK_SKEW = 1  # Small clock offsets between compute and dashboard hosts.
 TTL = 3600
 MAX_STARTS = 2
-ACCOUNTING_INTERVAL = 10
+ACCOUNTING_INTERVAL = 5
 LIVE_RETRY_INTERVAL = 10
 LIVE_RETRY_MAX = 60
 # Each completion check makes at most two scheduler calls (including fallback).
